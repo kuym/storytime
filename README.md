@@ -15,6 +15,10 @@ plain float32 voice tensors that the Rust CLI consumes.
 
 ## Features
 
+- **File or speaker output.** With `-o PATH` writes a WAV file; without `-o`
+  plays directly to the default output device using OS-native audio APIs
+  (AudioToolbox's AudioQueue on macOS, ALSA on Linux) — no third-party
+  audio crates.
 - **Local & offline.** Model, voices, and runtime all live on disk. No network.
 - **Hardware-accelerated.** Runs on the Apple Neural Engine / GPU via CoreML,
   with automatic CPU fallback.
@@ -179,6 +183,9 @@ Skip this if you'll always pipe pre-computed IPA via `--ipa`.
 ### Basic
 
 ```sh
+# Play directly through the speakers (no -o)
+echo "Hello, world." | storytime --voice af_bella
+
 # Text in, WAV out (requires espeak-ng)
 echo "Hello, world." | storytime --voice af_bella -o hello.wav
 
@@ -189,6 +196,23 @@ echo "həlˈoʊ wˈɜːld." | storytime --ipa -o hello.wav
 espeak-ng -q --ipa=3 -v en-us "Hello, world." \
   | storytime --ipa -o hello.wav
 ```
+
+### Direct playback
+
+If you don't pass `-o`, the synthesized audio is played through the default
+output device using the OS-native audio API:
+
+- **macOS** — AudioToolbox's AudioQueue (linked via the `AudioToolbox`
+  system framework). No extra install; works on any supported macOS.
+- **Linux** — ALSA (`libasound`). Install the ALSA runtime if it isn't
+  already present (`sudo apt install libasound2` on Debian/Ubuntu, etc.).
+  Opening the `default` PCM device works transparently through PipeWire
+  and PulseAudio as well.
+
+Both paths are pure FFI — no `cpal`, `rodio`, or other third-party audio
+crates in the dependency tree. The `--sample-rate` and `--bit-depth` flags
+still apply to file output; playback always uses the resampled float32
+stream at the chosen `--sample-rate`.
 
 ### Controlling the output format
 
@@ -218,7 +242,7 @@ storytime --list-voices
 | `--ipa` | off | treat stdin as IPA (skip espeak-ng) |
 | `--assets PATH` | `../assets` | location of exported assets |
 | `--list-voices` | — | list available voices and exit |
-| `-o, --output PATH` | `out.wav` | output WAV path |
+| `-o, --output PATH` | *(unset)* | write WAV here; if omitted, play to default output device |
 
 ### Voices
 

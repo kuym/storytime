@@ -1,10 +1,16 @@
 // storytime: Kokoro-82M TTS CLI.
 //
 // Reads text or IPA phonemes from stdin, runs Kokoro via ONNX Runtime
-// (CoreML EP on Apple Silicon, CPU fallback), and writes a WAV file.
+// (CoreML EP on Apple Silicon, CPU fallback), and either writes a WAV
+// file (with `-o PATH`) or plays the audio directly to the default
+// output device (no `-o`).
 //
 // Text mode shells out to `espeak-ng` for grapheme->IPA conversion.
 // IPA mode (--ipa) skips that step so the tool composes in a POSIX pipeline.
+//
+// Playback uses OS-native APIs with no third-party crates:
+//   - macOS: AudioToolbox's AudioQueue (C API, system framework).
+//   - Linux: ALSA's libasound (the lowest common denominator).
 
 use std::collections::HashMap;
 use std::fs;
@@ -85,9 +91,10 @@ struct Args {
     #[arg(long)]
     list_voices: bool,
 
-    /// Output WAV path.
-    #[arg(short = 'o', long, default_value = "out.wav")]
-    output: PathBuf,
+    /// Output WAV path. If omitted, audio plays directly to the default
+    /// output device via the OS-native audio API.
+    #[arg(short = 'o', long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -535,7 +542,302 @@ fn main() -> Result<()> {
     );
 
     let resampled = resample(&samples, NATIVE_SR, args.sample_rate)?;
-    write_wav(&args.output, &resampled, args.sample_rate, args.bit_depth)?;
-    eprintln!("storytime: wrote {}", args.output.display());
+    match &args.output {
+        Some(path) => {
+            write_wav(path, &resampled, args.sample_rate, args.bit_depth)?;
+            eprintln!("storytime: wrote {}", path.display());
+        }
+        None => {
+            eprintln!("storytime: playing to default output device");
+            playback::play(&resampled, args.sample_rate)?;
+        }
+    }
     Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Playback: OS-native, no third-party crates.
+// ----------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+mod playback {
+    //! macOS playback via AudioToolbox's AudioQueue (C API, system framework).
+    //!
+    //! AudioQueue is the "simplest modern" in-memory-PCM path that doesn't
+    //! require Objective-C or file I/O: allocate a buffer, copy packed-float
+    //! samples in, enqueue, start, wait for the buffer to drain, dispose.
+    use anyhow::{anyhow, Result};
+    use std::os::raw::c_void;
+    use std::ptr;
+    use std::time::Duration;
+
+    // AudioStreamBasicDescription — laid out to match <CoreAudioTypes/CoreAudioBaseTypes.h>.
+    #[repr(C)]
+    struct AudioStreamBasicDescription {
+        sample_rate: f64,
+        format_id: u32,
+        format_flags: u32,
+        bytes_per_packet: u32,
+        frames_per_packet: u32,
+        bytes_per_frame: u32,
+        channels_per_frame: u32,
+        bits_per_channel: u32,
+        _reserved: u32,
+    }
+
+    #[repr(C)]
+    struct AudioQueueBuffer {
+        audio_data_bytes_capacity: u32,
+        audio_data: *mut c_void,
+        audio_data_byte_size: u32,
+        user_data: *mut c_void,
+        packet_description_capacity: u32,
+        packet_descriptions: *mut c_void,
+        packet_description_count: u32,
+    }
+
+    // 'lpcm' FourCC in big-endian packing — AudioToolbox's format constant.
+    const K_AUDIO_FORMAT_LINEAR_PCM: u32 = 0x6C70636D;
+    const K_FLAG_IS_FLOAT: u32 = 1;
+    const K_FLAG_IS_PACKED: u32 = 1 << 3;
+
+    type AudioQueueRef = *mut c_void;
+
+    // Buffer-done callback. We ship one buffer, so we just note completion.
+    // The callback is invoked on the queue's internal thread.
+    extern "C" fn on_buffer_done(
+        user_data: *mut c_void,
+        _queue: AudioQueueRef,
+        _buffer: *mut AudioQueueBuffer,
+    ) {
+        unsafe {
+            let done = &*(user_data as *const std::sync::atomic::AtomicBool);
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[link(name = "AudioToolbox", kind = "framework")]
+    extern "C" {
+        fn AudioQueueNewOutput(
+            format: *const AudioStreamBasicDescription,
+            callback: extern "C" fn(*mut c_void, AudioQueueRef, *mut AudioQueueBuffer),
+            user_data: *mut c_void,
+            callback_run_loop: *mut c_void,
+            callback_run_loop_mode: *mut c_void,
+            flags: u32,
+            out_aq: *mut AudioQueueRef,
+        ) -> i32;
+        fn AudioQueueAllocateBuffer(
+            aq: AudioQueueRef,
+            buffer_byte_size: u32,
+            out_buffer: *mut *mut AudioQueueBuffer,
+        ) -> i32;
+        fn AudioQueueEnqueueBuffer(
+            aq: AudioQueueRef,
+            buffer: *mut AudioQueueBuffer,
+            num_packet_descs: u32,
+            packet_descs: *const c_void,
+        ) -> i32;
+        fn AudioQueueStart(aq: AudioQueueRef, start_time: *const c_void) -> i32;
+        fn AudioQueueStop(aq: AudioQueueRef, immediate: u8) -> i32;
+        fn AudioQueueDispose(aq: AudioQueueRef, immediate: u8) -> i32;
+    }
+
+    pub fn play(samples: &[f32], sample_rate: u32) -> Result<()> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+
+        let fmt = AudioStreamBasicDescription {
+            sample_rate: sample_rate as f64,
+            format_id: K_AUDIO_FORMAT_LINEAR_PCM,
+            format_flags: K_FLAG_IS_FLOAT | K_FLAG_IS_PACKED,
+            bytes_per_packet: 4,
+            frames_per_packet: 1,
+            bytes_per_frame: 4,
+            channels_per_frame: 1,
+            bits_per_channel: 32,
+            _reserved: 0,
+        };
+
+        let done = Box::new(std::sync::atomic::AtomicBool::new(false));
+        let done_ptr = &*done as *const _ as *mut c_void;
+
+        let mut queue: AudioQueueRef = ptr::null_mut();
+        let status = unsafe {
+            AudioQueueNewOutput(
+                &fmt,
+                on_buffer_done,
+                done_ptr,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                &mut queue,
+            )
+        };
+        if status != 0 {
+            return Err(anyhow!("AudioQueueNewOutput failed: OSStatus {status}"));
+        }
+
+        let byte_size = (samples.len() * std::mem::size_of::<f32>()) as u32;
+        let mut buffer: *mut AudioQueueBuffer = ptr::null_mut();
+        let status = unsafe { AudioQueueAllocateBuffer(queue, byte_size, &mut buffer) };
+        if status != 0 {
+            unsafe { AudioQueueDispose(queue, 1) };
+            return Err(anyhow!("AudioQueueAllocateBuffer failed: OSStatus {status}"));
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                samples.as_ptr() as *const u8,
+                (*buffer).audio_data as *mut u8,
+                byte_size as usize,
+            );
+            (*buffer).audio_data_byte_size = byte_size;
+        }
+
+        let status = unsafe { AudioQueueEnqueueBuffer(queue, buffer, 0, ptr::null()) };
+        if status != 0 {
+            unsafe { AudioQueueDispose(queue, 1) };
+            return Err(anyhow!("AudioQueueEnqueueBuffer failed: OSStatus {status}"));
+        }
+
+        let status = unsafe { AudioQueueStart(queue, ptr::null()) };
+        if status != 0 {
+            unsafe { AudioQueueDispose(queue, 1) };
+            return Err(anyhow!("AudioQueueStart failed: OSStatus {status}"));
+        }
+
+        // Wait for the buffer-done callback. Poll briefly; the queue runs on
+        // its own thread. Cap the total wait at duration + 2s as a safeguard.
+        let duration = Duration::from_secs_f64(samples.len() as f64 / sample_rate as f64);
+        let deadline = std::time::Instant::now() + duration + Duration::from_secs(2);
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Small tail so the device finishes flushing its own buffer.
+        std::thread::sleep(Duration::from_millis(80));
+
+        unsafe {
+            AudioQueueStop(queue, 0);
+            AudioQueueDispose(queue, 1);
+        }
+        drop(done);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod playback {
+    //! Linux playback via ALSA (libasound).
+    //!
+    //! ALSA is present on every desktop/server Linux install; PipeWire and
+    //! PulseAudio both provide ALSA-compatible PCM devices through the
+    //! `default` alias, so opening "default" works regardless of the
+    //! higher-level sound server in use.
+    use anyhow::{anyhow, Result};
+    use std::ffi::{CStr, CString};
+    use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
+
+    const SND_PCM_STREAM_PLAYBACK: c_int = 0;
+    const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
+    const SND_PCM_FORMAT_FLOAT_LE: c_int = 14;
+
+    #[link(name = "asound")]
+    extern "C" {
+        fn snd_pcm_open(
+            pcm: *mut *mut c_void,
+            name: *const c_char,
+            stream: c_int,
+            mode: c_int,
+        ) -> c_int;
+        fn snd_pcm_set_params(
+            pcm: *mut c_void,
+            format: c_int,
+            access: c_int,
+            channels: c_uint,
+            rate: c_uint,
+            soft_resample: c_int,
+            latency: c_uint,
+        ) -> c_int;
+        fn snd_pcm_writei(pcm: *mut c_void, buffer: *const c_void, size: c_ulong) -> c_long;
+        fn snd_pcm_recover(pcm: *mut c_void, err: c_int, silent: c_int) -> c_int;
+        fn snd_pcm_drain(pcm: *mut c_void) -> c_int;
+        fn snd_pcm_close(pcm: *mut c_void) -> c_int;
+        fn snd_strerror(err: c_int) -> *const c_char;
+    }
+
+    fn err_string(code: c_int) -> String {
+        unsafe {
+            let p = snd_strerror(code);
+            if p.is_null() {
+                format!("code {code}")
+            } else {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        }
+    }
+
+    pub fn play(samples: &[f32], sample_rate: u32) -> Result<()> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let mut pcm: *mut c_void = std::ptr::null_mut();
+        let name = CString::new("default").unwrap();
+        let rc = unsafe { snd_pcm_open(&mut pcm, name.as_ptr(), SND_PCM_STREAM_PLAYBACK, 0) };
+        if rc < 0 {
+            return Err(anyhow!("snd_pcm_open: {}", err_string(rc)));
+        }
+        let rc = unsafe {
+            snd_pcm_set_params(
+                pcm,
+                SND_PCM_FORMAT_FLOAT_LE,
+                SND_PCM_ACCESS_RW_INTERLEAVED,
+                1,           // mono
+                sample_rate, // rate
+                1,           // allow soft resampling
+                500_000,     // target latency in microseconds (~0.5s)
+            )
+        };
+        if rc < 0 {
+            unsafe { snd_pcm_close(pcm) };
+            return Err(anyhow!("snd_pcm_set_params: {}", err_string(rc)));
+        }
+
+        // Write in a loop: snd_pcm_writei may return fewer frames than requested
+        // or a negative error (e.g. -EPIPE on xrun) which we recover from.
+        let mut remaining = samples.len();
+        let mut cursor = samples.as_ptr();
+        while remaining > 0 {
+            let n = unsafe { snd_pcm_writei(pcm, cursor as *const c_void, remaining as c_ulong) };
+            if n < 0 {
+                let rec = unsafe { snd_pcm_recover(pcm, n as c_int, 1) };
+                if rec < 0 {
+                    unsafe { snd_pcm_close(pcm) };
+                    return Err(anyhow!("snd_pcm_writei: {}", err_string(rec)));
+                }
+                continue;
+            }
+            let written = n as usize;
+            cursor = unsafe { cursor.add(written) };
+            remaining -= written;
+        }
+
+        unsafe {
+            snd_pcm_drain(pcm);
+            snd_pcm_close(pcm);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+mod playback {
+    use anyhow::{bail, Result};
+    pub fn play(_samples: &[f32], _sample_rate: u32) -> Result<()> {
+        bail!("direct playback is only implemented on macOS and Linux; pass -o PATH to write a WAV instead");
+    }
 }
