@@ -146,17 +146,164 @@ fn load_tokens(assets: &Path) -> Result<HashMap<String, i64>> {
     Ok(t.vocab)
 }
 
-/// Tokenize IPA input by grapheme-cluster lookup against the vocab.
+/// Tokenize IPA input by character lookup against the vocab.
 /// Unknown characters are silently dropped (matches upstream behavior).
 fn tokenize(ipa: &str, vocab: &HashMap<String, i64>) -> Vec<i64> {
     let mut out = Vec::with_capacity(ipa.len());
     for ch in ipa.chars() {
-        // vocab keys are single chars in config.json.
         let mut buf = [0u8; 4];
         let key = ch.encode_utf8(&mut buf);
         if let Some(&id) = vocab.get(key) {
             out.push(id);
         }
+    }
+    out
+}
+
+fn count_tokens(s: &str, vocab: &HashMap<String, i64>) -> usize {
+    s.chars()
+        .filter(|c| {
+            let mut buf = [0u8; 4];
+            vocab.contains_key(c.encode_utf8(&mut buf))
+        })
+        .count()
+}
+
+/// Split IPA into chunks that each tokenize to at most `max_tokens`.
+///
+/// Strategy, in order of preference:
+///   1. Cut at sentence boundaries (`. ! ? ; …`) — punctuation stays with the
+///      preceding chunk so prosody is preserved.
+///   2. If a single sentence exceeds the budget, fall back to whitespace
+///      (word) boundaries within that sentence.
+///   3. If a single word still exceeds the budget, hard-split on characters.
+///
+/// Adjacent short sentences are greedily packed into one chunk up to the
+/// budget to minimize the number of inference calls.
+fn chunk_ipa(ipa: &str, vocab: &HashMap<String, i64>, max_tokens: usize) -> Vec<String> {
+    assert!(max_tokens > 0);
+
+    // Fast path: fits in one chunk.
+    if count_tokens(ipa, vocab) <= max_tokens {
+        return vec![ipa.to_string()];
+    }
+
+    // 1. Split into sentences, keeping terminators with the preceding text.
+    let sentences = split_keep(ipa, |c| matches!(c, '.' | '!' | '?' | ';' | '…'));
+
+    // 2. For any sentence that's still too long, expand into word/char pieces.
+    let mut pieces: Vec<String> = Vec::new();
+    for s in sentences {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if count_tokens(trimmed, vocab) <= max_tokens {
+            pieces.push(trimmed.to_string());
+        } else {
+            pieces.extend(split_long_sentence(trimmed, vocab, max_tokens));
+        }
+    }
+
+    // 3. Greedily pack adjacent pieces up to the budget.
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_tokens = 0usize;
+    for p in pieces {
+        let p_tokens = count_tokens(&p, vocab);
+        let join_tokens = if cur.is_empty() { 0 } else { 1 }; // joining space
+        if cur_tokens + join_tokens + p_tokens <= max_tokens && !cur.is_empty() {
+            cur.push(' ');
+            cur.push_str(&p);
+            cur_tokens += join_tokens + p_tokens;
+        } else {
+            if !cur.is_empty() {
+                chunks.push(std::mem::take(&mut cur));
+            }
+            cur = p;
+            cur_tokens = p_tokens;
+        }
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// Split `s` into substrings, cutting after any char matching `is_sep`.
+/// The separator character is retained at the end of the preceding piece.
+fn split_keep(s: &str, is_sep: impl Fn(char) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in s.chars() {
+        cur.push(ch);
+        if is_sep(ch) {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Break a sentence that exceeds the budget into word-sized (or smaller) pieces.
+fn split_long_sentence(
+    sentence: &str,
+    vocab: &HashMap<String, i64>,
+    max_tokens: usize,
+) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut cur = String::new();
+    let mut cur_tokens = 0usize;
+    for word in sentence.split_whitespace() {
+        let w_tokens = count_tokens(word, vocab);
+        if w_tokens > max_tokens {
+            // Flush the current buffer, then hard-split the oversized word.
+            if !cur.is_empty() {
+                pieces.push(std::mem::take(&mut cur));
+                cur_tokens = 0;
+            }
+            pieces.extend(hard_split(word, vocab, max_tokens));
+            continue;
+        }
+        let join_tokens = if cur.is_empty() { 0 } else { 1 };
+        if cur_tokens + join_tokens + w_tokens > max_tokens {
+            pieces.push(std::mem::take(&mut cur));
+            cur_tokens = 0;
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+            cur_tokens += 1;
+        }
+        cur.push_str(word);
+        cur_tokens += w_tokens;
+    }
+    if !cur.is_empty() {
+        pieces.push(cur);
+    }
+    pieces
+}
+
+/// Last resort: split a whitespace-free run of characters by codepoint count.
+fn hard_split(s: &str, vocab: &HashMap<String, i64>, max_tokens: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_tokens = 0usize;
+    for ch in s.chars() {
+        let mut buf = [0u8; 4];
+        let counts = vocab.contains_key(ch.encode_utf8(&mut buf));
+        if counts && cur_tokens + 1 > max_tokens {
+            out.push(std::mem::take(&mut cur));
+            cur_tokens = 0;
+        }
+        cur.push(ch);
+        if counts {
+            cur_tokens += 1;
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
     }
     out
 }
@@ -303,30 +450,19 @@ fn main() -> Result<()> {
     };
 
     let vocab = load_tokens(&assets)?;
-    let tokens = tokenize(&ipa, &vocab);
-    if tokens.is_empty() {
+    let voice = load_voice(&assets, &args.voice)?;
+    let max_tokens = voice.rows - 1;
+
+    let chunks = chunk_ipa(&ipa, &vocab, max_tokens);
+    if chunks.is_empty() {
         bail!("no valid phoneme tokens produced from input");
     }
-    let voice = load_voice(&assets, &args.voice)?;
-    if tokens.len() > voice.rows - 1 {
-        bail!(
-            "input too long: {} tokens (voice {} supports up to {})",
-            tokens.len(),
-            args.voice,
-            voice.rows - 1
-        );
-    }
-    let style = select_style(&voice, tokens.len());
 
-    // Pad with 0 on both sides per model convention.
-    let mut padded = Vec::with_capacity(tokens.len() + 2);
-    padded.push(0);
-    padded.extend_from_slice(&tokens);
-    padded.push(0);
-
+    let total_tokens: usize = chunks.iter().map(|c| count_tokens(c, &vocab)).sum();
     eprintln!(
-        "storytime: {} phonemes, voice={}, speed={}",
-        tokens.len(),
+        "storytime: {} phonemes in {} chunk(s), voice={}, speed={}",
+        total_tokens,
+        chunks.len(),
         args.voice,
         args.speed
     );
@@ -342,28 +478,57 @@ fn main() -> Result<()> {
         .commit_from_file(assets.join("kokoro.onnx"))
         .map_err(ort_err)?;
 
-    let ids_shape = vec![1_i64, padded.len() as i64];
-    let style_shape = vec![1_i64, STYLE_DIM as i64];
-    let speed_shape = vec![1_i64];
+    // ~150ms of silence between chunks; natural-sounding sentence gap.
+    let gap_samples = vec![0.0_f32; (NATIVE_SR as usize * 150) / 1000];
 
-    let ids_t = Tensor::from_array((ids_shape, padded)).map_err(ort_err)?;
-    let style_t = Tensor::from_array((style_shape, style)).map_err(ort_err)?;
-    let speed_t = Tensor::from_array((speed_shape, vec![args.speed])).map_err(ort_err)?;
+    let mut samples: Vec<f32> = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let tokens = tokenize(chunk, &vocab);
+        if tokens.is_empty() {
+            continue;
+        }
+        let style = select_style(&voice, tokens.len());
 
-    let outputs = session
-        .run(ort::inputs![
-            "input_ids" => ids_t,
-            "style" => style_t,
-            "speed" => speed_t,
-        ])
-        .map_err(ort_err)?;
+        // Pad with 0 on both sides per model convention.
+        let mut padded = Vec::with_capacity(tokens.len() + 2);
+        padded.push(0);
+        padded.extend_from_slice(&tokens);
+        padded.push(0);
 
-    let (_shape, audio) = outputs["audio"]
-        .try_extract_tensor::<f32>()
-        .map_err(ort_err)?;
-    let samples: Vec<f32> = audio.to_vec();
+        let ids_t = Tensor::from_array((vec![1_i64, padded.len() as i64], padded))
+            .map_err(ort_err)?;
+        let style_t = Tensor::from_array((vec![1_i64, STYLE_DIM as i64], style))
+            .map_err(ort_err)?;
+        let speed_t = Tensor::from_array((vec![1_i64], vec![args.speed]))
+            .map_err(ort_err)?;
+
+        let outputs = session
+            .run(ort::inputs![
+                "input_ids" => ids_t,
+                "style" => style_t,
+                "speed" => speed_t,
+            ])
+            .map_err(ort_err)?;
+
+        let (_shape, audio) = outputs["audio"]
+            .try_extract_tensor::<f32>()
+            .map_err(ort_err)?;
+
+        if i > 0 {
+            samples.extend_from_slice(&gap_samples);
+        }
+        samples.extend_from_slice(audio);
+        eprintln!(
+            "storytime: chunk {}/{}: {} tokens -> {} samples",
+            i + 1,
+            chunks.len(),
+            tokens.len(),
+            audio.len()
+        );
+    }
+
     eprintln!(
-        "storytime: {} samples @ {} Hz ({:.2}s)",
+        "storytime: {} samples total @ {} Hz ({:.2}s)",
         samples.len(),
         NATIVE_SR,
         samples.len() as f32 / NATIVE_SR as f32

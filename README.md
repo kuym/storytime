@@ -23,6 +23,11 @@ plain float32 voice tensors that the Rust CLI consumes.
     `espeak-ng` for grapheme-to-phoneme conversion.
   - *IPA mode* (`--ipa`): stdin is IPA phonemes directly. No `espeak-ng`
     dependency on this process — composes in a POSIX pipeline with any G2P.
+- **Automatic chunking.** Inputs longer than the model's ~510-token style
+  limit are automatically split at sentence boundaries (falling back to word,
+  then character boundaries if a sentence or word is itself too long),
+  synthesized chunk-by-chunk, and concatenated with a short silence gap
+  between pieces.
 - **54 voices** from the Kokoro-82M release (en-US, en-GB, Spanish, French,
   Italian, Hindi, Japanese, Brazilian Portuguese, Mandarin).
 - **Configurable output.** 16/24/32-bit PCM or IEEE float32, any sample rate
@@ -267,9 +272,13 @@ or use `--ipa` and provide phonemes from another source.
 **`Context leak detected, msgtracer returned -1`** — cosmetic noise from
 macOS's CoreML stack. Inference still runs correctly. Ignore.
 
-**`input too long: N tokens`** — the model's style tensor has a fixed maximum
-length (510–511 depending on voice). Split long inputs into sentences and
-synthesize them separately.
+**Long inputs** — the model's style tensor has a fixed maximum length
+(510–511 phoneme tokens, depending on voice). The CLI handles this
+automatically: long inputs are split at sentence boundaries (`.!?;…`),
+then at word boundaries inside any sentence that's still too long, then
+at character boundaries as a last resort. Each chunk is synthesized
+independently and the results are concatenated with a ~150 ms silence gap.
+Progress is printed per chunk on stderr.
 
 **Pronunciation is wrong** — check that your `--voice` language matches the
 input language, and that the IPA being fed to the model looks reasonable.
