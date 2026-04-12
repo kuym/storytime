@@ -197,6 +197,23 @@ espeak-ng -q --ipa=3 -v en-us "Hello, world." \
   | storytime --ipa -o hello.wav
 ```
 
+### Streaming to stdout
+
+Passing `-o -` writes the WAV to stdout so the output can be piped
+directly into another process without a temporary file:
+
+```sh
+echo "Streamed." | storytime -o - | ffplay -autoexit -nodisp -
+echo "Streamed." | storytime -o - | ffmpeg -i - out.mp3
+```
+
+Because stdout is not seekable, the RIFF/data size fields in the
+header can't be back-patched after the fact and are set to the maximum
+`u32` value (`0xFFFFFFFF`). Streaming-aware decoders (ffmpeg, sox, VLC,
+the majority of media players) either honor that sentinel or read
+until EOF. A few strict parsers that validate the declared sizes may
+reject these streams — save to a file with `-o out.wav` in that case.
+
 ### Direct playback
 
 If you don't pass `-o`, the synthesized audio is played through the default
@@ -242,7 +259,7 @@ storytime --list-voices
 | `--ipa` | off | treat stdin as IPA (skip espeak-ng) |
 | `--assets PATH` | `../assets` | location of exported assets |
 | `--list-voices` | — | list available voices and exit |
-| `-o, --output PATH` | *(unset)* | write WAV here; if omitted, play to default output device |
+| `-o, --output PATH` | *(unset)* | write WAV here; `-` streams WAV to stdout; if omitted, play to default output device |
 
 ### Voices
 

@@ -390,6 +390,80 @@ fn resample(samples: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
     Ok(out.into_iter().next().unwrap())
 }
 
+/// Stream a WAV to any writer without seeking.
+///
+/// Because stdout isn't seekable, the RIFF/data size fields can't be
+/// back-patched after the sample count is known. Per the user's request,
+/// they're set to `0xFFFFFFFF` (the maximum `u32`); downstream decoders
+/// that support streaming WAVs (ffmpeg, sox, etc.) either honor the
+/// sentinel or read until EOF.
+fn write_wav_stream<W: std::io::Write>(
+    mut w: W,
+    samples: &[f32],
+    sr: u32,
+    depth: BitDepth,
+) -> Result<()> {
+    let (bits, fmt_code): (u16, u16) = match depth {
+        BitDepth::I16 => (16, 1),
+        BitDepth::I24 => (24, 1),
+        BitDepth::I32 => (32, 1),
+        BitDepth::F32 => (32, 3), // WAVE_FORMAT_IEEE_FLOAT
+    };
+    let channels: u16 = 1;
+    let block_align: u16 = channels * (bits / 8);
+    let byte_rate: u32 = sr * block_align as u32;
+    let max = u32::MAX;
+
+    // RIFF header
+    w.write_all(b"RIFF")?;
+    w.write_all(&max.to_le_bytes())?; // file size - 8 (streaming sentinel)
+    w.write_all(b"WAVE")?;
+
+    // fmt chunk (16-byte PCM / IEEE float form)
+    w.write_all(b"fmt ")?;
+    w.write_all(&16u32.to_le_bytes())?;
+    w.write_all(&fmt_code.to_le_bytes())?;
+    w.write_all(&channels.to_le_bytes())?;
+    w.write_all(&sr.to_le_bytes())?;
+    w.write_all(&byte_rate.to_le_bytes())?;
+    w.write_all(&block_align.to_le_bytes())?;
+    w.write_all(&bits.to_le_bytes())?;
+
+    // data chunk header
+    w.write_all(b"data")?;
+    w.write_all(&max.to_le_bytes())?; // data size (streaming sentinel)
+
+    // payload
+    match depth {
+        BitDepth::F32 => {
+            for &s in samples {
+                w.write_all(&s.clamp(-1.0, 1.0).to_le_bytes())?;
+            }
+        }
+        BitDepth::I16 => {
+            for &s in samples {
+                let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                w.write_all(&v.to_le_bytes())?;
+            }
+        }
+        BitDepth::I24 => {
+            let peak = ((1i32 << 23) - 1) as f32;
+            for &s in samples {
+                let v = (s.clamp(-1.0, 1.0) * peak) as i32;
+                w.write_all(&v.to_le_bytes()[..3])?;
+            }
+        }
+        BitDepth::I32 => {
+            for &s in samples {
+                let v = (s.clamp(-1.0, 1.0) as f64 * i32::MAX as f64) as i32;
+                w.write_all(&v.to_le_bytes())?;
+            }
+        }
+    }
+    w.flush()?;
+    Ok(())
+}
+
 fn write_wav(path: &Path, samples: &[f32], sr: u32, depth: BitDepth) -> Result<()> {
     let (bits, fmt) = match depth {
         BitDepth::I16 => (16u16, SampleFormat::Int),
@@ -543,6 +617,12 @@ fn main() -> Result<()> {
 
     let resampled = resample(&samples, NATIVE_SR, args.sample_rate)?;
     match &args.output {
+        Some(path) if path.as_os_str() == "-" => {
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            write_wav_stream(&mut handle, &resampled, args.sample_rate, args.bit_depth)?;
+            eprintln!("storytime: wrote WAV stream to stdout");
+        }
         Some(path) => {
             write_wav(path, &resampled, args.sample_rate, args.bit_depth)?;
             eprintln!("storytime: wrote {}", path.display());
