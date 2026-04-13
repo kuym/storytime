@@ -91,10 +91,53 @@ struct Args {
     #[arg(long)]
     list_voices: bool,
 
+    /// Silence inserted between chunker-forced splits within a paragraph, in ms.
+    #[arg(long, default_value_t = 120)]
+    chunk_gap_ms: u32,
+
+    /// Silence inserted between paragraphs (separated by a blank line), in ms.
+    #[arg(long, default_value_t = 400)]
+    paragraph_gap_ms: u32,
+
+    /// Silence inserted between sections (multiple blank lines or `## ` heading), in ms.
+    #[arg(long, default_value_t = 700)]
+    section_gap_ms: u32,
+
+    /// Silence inserted between chapters (`# ` heading), in ms.
+    #[arg(long, default_value_t = 1200)]
+    chapter_gap_ms: u32,
+
+    /// Linear fade-in/out applied at every chunk seam, in ms (avoids clicks).
+    #[arg(long, default_value_t = 10)]
+    fade_ms: u32,
+
+    /// Amplitude below which leading/trailing samples are trimmed from each
+    /// chunk before the gap silence is inserted. Set to 0 to disable.
+    #[arg(long, default_value_t = 0.005)]
+    trim_threshold: f32,
+
     /// Output WAV path. If omitted, audio plays directly to the default
-    /// output device via the OS-native audio API.
+    /// output device via the OS-native audio API. Use `-` to stream the
+    /// WAV to stdout.
     #[arg(short = 'o', long)]
     output: Option<PathBuf>,
+}
+
+/// Boundary between two adjacent audio pieces, ordered by strength.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Boundary {
+    None = 0,
+    Chunk = 1,
+    Paragraph = 2,
+    Section = 3,
+    Chapter = 4,
+}
+
+/// One structural block of input — a paragraph of running text, or a heading.
+/// `gap_before` is the silence gap to insert before rendering this block.
+struct Block {
+    text: String,
+    gap_before: Boundary,
 }
 
 #[derive(Deserialize)]
@@ -464,6 +507,147 @@ fn write_wav_stream<W: std::io::Write>(
     Ok(())
 }
 
+/// Parse stdin into structural blocks so paragraph / section / chapter
+/// boundaries survive to the synthesis stage (espeak-ng otherwise flattens
+/// all whitespace). Rules:
+///   - One blank line between non-empty paragraphs -> Paragraph boundary.
+///   - Two or more blank lines -> Section boundary.
+///   - A block starting with `# `   -> Chapter boundary (marker stripped).
+///   - A block starting with `## `  -> Section boundary (marker stripped).
+///   - A block starting with `### ` -> Section boundary (marker stripped).
+/// Internal newlines within a paragraph are collapsed to spaces so
+/// line-wrapped prose reads naturally.
+fn parse_structure(input: &str) -> Vec<Block> {
+    let input = input.replace("\r\n", "\n");
+    let mut blocks: Vec<Block> = Vec::new();
+
+    let mut current: Vec<String> = Vec::new();
+    let mut blanks_before_current: usize = 0;
+    let mut pending_blanks: usize = 0;
+
+    let flush = |current: &mut Vec<String>, blanks_before: usize, blocks: &mut Vec<Block>| {
+        let joined = current.join(" ");
+        let trimmed = joined.trim();
+        if trimmed.is_empty() {
+            current.clear();
+            return;
+        }
+        let (text, heading) = if let Some(s) = trimmed.strip_prefix("# ") {
+            (s.trim().to_string(), Some(Boundary::Chapter))
+        } else if let Some(s) = trimmed.strip_prefix("## ") {
+            (s.trim().to_string(), Some(Boundary::Section))
+        } else if let Some(s) = trimmed.strip_prefix("### ") {
+            (s.trim().to_string(), Some(Boundary::Section))
+        } else {
+            (trimmed.to_string(), None)
+        };
+        let structural = match blanks_before {
+            0 => Boundary::None,
+            1 => Boundary::Paragraph,
+            _ => Boundary::Section,
+        };
+        let gap_before = if blocks.is_empty() {
+            Boundary::None
+        } else {
+            match heading {
+                Some(h) => structural.max(h),
+                None => structural,
+            }
+        };
+        blocks.push(Block { text, gap_before });
+        current.clear();
+    };
+
+    for line in input.split('\n') {
+        if line.trim().is_empty() {
+            if current.is_empty() {
+                blanks_before_current += 1;
+            } else {
+                pending_blanks += 1;
+            }
+        } else {
+            if pending_blanks > 0 {
+                flush(&mut current, blanks_before_current, &mut blocks);
+                blanks_before_current = pending_blanks;
+                pending_blanks = 0;
+            }
+            current.push(line.trim().to_string());
+        }
+    }
+    flush(&mut current, blanks_before_current, &mut blocks);
+    blocks
+}
+
+fn gap_samples_for(b: Boundary, args: &Args, sr: u32) -> usize {
+    let ms = match b {
+        Boundary::None => 0,
+        Boundary::Chunk => args.chunk_gap_ms,
+        Boundary::Paragraph => args.paragraph_gap_ms,
+        Boundary::Section => args.section_gap_ms,
+        Boundary::Chapter => args.chapter_gap_ms,
+    };
+    (sr as usize * ms as usize) / 1000
+}
+
+/// Trim leading/trailing samples whose magnitude is below `threshold`.
+/// Returns an empty slice if nothing clears the threshold.
+fn trim_silence(samples: &[f32], threshold: f32) -> &[f32] {
+    if threshold <= 0.0 || samples.is_empty() {
+        return samples;
+    }
+    let start = samples.iter().position(|s| s.abs() > threshold);
+    let end = samples.iter().rposition(|s| s.abs() > threshold);
+    match (start, end) {
+        (Some(s), Some(e)) => &samples[s..=e],
+        _ => &[],
+    }
+}
+
+/// Apply an in-place linear fade-in over the first `fade` samples and a
+/// fade-out over the last `fade` samples. Clamped to half the buffer.
+fn apply_fade(samples: &mut [f32], fade: usize) {
+    let n = samples.len();
+    let f = fade.min(n / 2);
+    if f == 0 {
+        return;
+    }
+    for i in 0..f {
+        let gain = (i as f32 + 1.0) / (f as f32 + 1.0);
+        samples[i] *= gain;
+        samples[n - 1 - i] *= gain;
+    }
+}
+
+fn synthesize_chunk(
+    session: &mut Session,
+    tokens: &[i64],
+    style: Vec<f32>,
+    speed: f32,
+) -> Result<Vec<f32>> {
+    let mut padded = Vec::with_capacity(tokens.len() + 2);
+    padded.push(0);
+    padded.extend_from_slice(tokens);
+    padded.push(0);
+
+    let ids_t = Tensor::from_array((vec![1_i64, padded.len() as i64], padded)).map_err(ort_err)?;
+    let style_t =
+        Tensor::from_array((vec![1_i64, STYLE_DIM as i64], style)).map_err(ort_err)?;
+    let speed_t = Tensor::from_array((vec![1_i64], vec![speed])).map_err(ort_err)?;
+
+    let outputs = session
+        .run(ort::inputs![
+            "input_ids" => ids_t,
+            "style" => style_t,
+            "speed" => speed_t,
+        ])
+        .map_err(ort_err)?;
+
+    let (_shape, audio) = outputs["audio"]
+        .try_extract_tensor::<f32>()
+        .map_err(ort_err)?;
+    Ok(audio.to_vec())
+}
+
 fn write_wav(path: &Path, samples: &[f32], sr: u32, depth: BitDepth) -> Result<()> {
     let (bits, fmt) = match depth {
         BitDepth::I16 => (16u16, SampleFormat::Int),
@@ -519,31 +703,23 @@ fn main() -> Result<()> {
 
     let mut stdin_buf = String::new();
     std::io::stdin().read_to_string(&mut stdin_buf)?;
-    let input = stdin_buf.trim();
-    if input.is_empty() {
+    if stdin_buf.trim().is_empty() {
         bail!("stdin was empty");
     }
-
-    let ipa = if args.ipa {
-        input.to_string()
-    } else {
-        run_espeak(input)?
-    };
 
     let vocab = load_tokens(&assets)?;
     let voice = load_voice(&assets, &args.voice)?;
     let max_tokens = voice.rows - 1;
 
-    let chunks = chunk_ipa(&ipa, &vocab, max_tokens);
-    if chunks.is_empty() {
-        bail!("no valid phoneme tokens produced from input");
+    // Parse structure first so paragraph / section / chapter breaks survive
+    // espeak-ng (which would otherwise flatten all whitespace).
+    let blocks = parse_structure(&stdin_buf);
+    if blocks.is_empty() {
+        bail!("no content after structural parsing");
     }
-
-    let total_tokens: usize = chunks.iter().map(|c| count_tokens(c, &vocab)).sum();
     eprintln!(
-        "storytime: {} phonemes in {} chunk(s), voice={}, speed={}",
-        total_tokens,
-        chunks.len(),
+        "storytime: {} block(s), voice={}, speed={}",
+        blocks.len(),
         args.voice,
         args.speed
     );
@@ -559,53 +735,68 @@ fn main() -> Result<()> {
         .commit_from_file(assets.join("kokoro.onnx"))
         .map_err(ort_err)?;
 
-    // ~150ms of silence between chunks; natural-sounding sentence gap.
-    let gap_samples = vec![0.0_f32; (NATIVE_SR as usize * 150) / 1000];
+    let fade = (NATIVE_SR as usize * args.fade_ms as usize) / 1000;
 
-    let mut samples: Vec<f32> = Vec::new();
-    for (i, chunk) in chunks.iter().enumerate() {
-        let tokens = tokenize(chunk, &vocab);
-        if tokens.is_empty() {
+    // Accumulate (preceding_gap, audio) pieces so we can insert the right
+    // amount of silence between each.
+    let mut pieces: Vec<(Boundary, Vec<f32>)> = Vec::new();
+
+    for (block_idx, block) in blocks.iter().enumerate() {
+        let ipa = if args.ipa {
+            block.text.clone()
+        } else {
+            run_espeak(&block.text)?
+        };
+        let chunks = chunk_ipa(&ipa, &vocab, max_tokens);
+        if chunks.is_empty() {
             continue;
         }
-        let style = select_style(&voice, tokens.len());
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
+            let tokens = tokenize(chunk, &vocab);
+            if tokens.is_empty() {
+                continue;
+            }
+            let style = select_style(&voice, tokens.len());
+            let audio = synthesize_chunk(&mut session, &tokens, style, args.speed)?;
 
-        // Pad with 0 on both sides per model convention.
-        let mut padded = Vec::with_capacity(tokens.len() + 2);
-        padded.push(0);
-        padded.extend_from_slice(&tokens);
-        padded.push(0);
+            // Trim model-produced leading/trailing silence so the explicit
+            // typed gap below is the only thing the listener perceives.
+            let trimmed = trim_silence(&audio, args.trim_threshold).to_vec();
+            let mut buf = trimmed;
+            apply_fade(&mut buf, fade);
 
-        let ids_t = Tensor::from_array((vec![1_i64, padded.len() as i64], padded))
-            .map_err(ort_err)?;
-        let style_t = Tensor::from_array((vec![1_i64, STYLE_DIM as i64], style))
-            .map_err(ort_err)?;
-        let speed_t = Tensor::from_array((vec![1_i64], vec![args.speed]))
-            .map_err(ort_err)?;
+            let gap_before = if pieces.is_empty() {
+                Boundary::None
+            } else if chunk_idx == 0 {
+                block.gap_before
+            } else {
+                Boundary::Chunk
+            };
 
-        let outputs = session
-            .run(ort::inputs![
-                "input_ids" => ids_t,
-                "style" => style_t,
-                "speed" => speed_t,
-            ])
-            .map_err(ort_err)?;
-
-        let (_shape, audio) = outputs["audio"]
-            .try_extract_tensor::<f32>()
-            .map_err(ort_err)?;
-
-        if i > 0 {
-            samples.extend_from_slice(&gap_samples);
+            eprintln!(
+                "storytime: block {}/{} chunk {}/{}: {} tokens -> {} samples ({:?} gap)",
+                block_idx + 1,
+                blocks.len(),
+                chunk_idx + 1,
+                chunks.len(),
+                tokens.len(),
+                buf.len(),
+                gap_before,
+            );
+            pieces.push((gap_before, buf));
         }
+    }
+
+    if pieces.is_empty() {
+        bail!("no valid phoneme tokens produced from input");
+    }
+
+    let total_samples: usize = pieces.iter().map(|(b, a)| gap_samples_for(*b, &args, NATIVE_SR) + a.len()).sum();
+    let mut samples: Vec<f32> = Vec::with_capacity(total_samples);
+    for (gap, audio) in &pieces {
+        let gap_n = gap_samples_for(*gap, &args, NATIVE_SR);
+        samples.resize(samples.len() + gap_n, 0.0);
         samples.extend_from_slice(audio);
-        eprintln!(
-            "storytime: chunk {}/{}: {} tokens -> {} samples",
-            i + 1,
-            chunks.len(),
-            tokens.len(),
-            audio.len()
-        );
     }
 
     eprintln!(

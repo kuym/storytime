@@ -32,6 +32,11 @@ plain float32 voice tensors that the Rust CLI consumes.
   then character boundaries if a sentence or word is itself too long),
   synthesized chunk-by-chunk, and concatenated with a short silence gap
   between pieces.
+- **Structural pause handling.** Paragraph, section, and chapter boundaries
+  are preserved from the input and translated into longer silence gaps
+  (configurable via flags). Each chunk's leading/trailing model-produced
+  silence is trimmed and a short linear fade is applied at the seams so the
+  resulting audio has clean, realistically-spaced transitions.
 - **54 voices** from the Kokoro-82M release (en-US, en-GB, Spanish, French,
   Italian, Hindi, Japanese, Brazilian Portuguese, Mandarin).
 - **Configurable output.** 16/24/32-bit PCM or IEEE float32, any sample rate
@@ -197,6 +202,62 @@ espeak-ng -q --ipa=3 -v en-us "Hello, world." \
   | storytime --ipa -o hello.wav
 ```
 
+### Structural pauses
+
+Kokoro produces natural prosody (short pauses on `.`/`,`/`;`/etc.) inside a
+block of running text, but espeak-ng collapses all whitespace before the
+model sees anything — so without help, paragraph and chapter boundaries
+get the same pause as a comma.
+
+`storytime` parses the input into structural blocks *before* phonemization
+and inserts a typed silence gap at each boundary:
+
+| boundary | how it's detected | default gap |
+|---|---|---|
+| paragraph | one blank line between non-empty lines | 400 ms |
+| section | two or more blank lines, or a `## `/`### ` heading | 700 ms |
+| chapter | a `# ` heading | 1200 ms |
+| within-paragraph chunk split | forced by the 510-token limit | 120 ms |
+
+Markdown heading markers (`# `, `## `, `### `) are stripped from the spoken
+text but their presence upgrades the boundary strength. So this input:
+
+```
+# Chapter One
+
+The night was dark and stormy.
+
+Suddenly, a shot rang out.
+
+## A Pause
+
+It was quiet again.
+
+# Chapter Two
+
+The end.
+```
+
+…produces "Chapter One" → 1200 ms → paragraph → 400 ms → paragraph →
+700 ms ("A Pause") → 400 ms → paragraph → 1200 ms → "Chapter Two" → 400 ms
+→ "The end." (and the `#` markers themselves are not spoken).
+
+The flags `--paragraph-gap-ms`, `--section-gap-ms`, `--chapter-gap-ms`,
+`--chunk-gap-ms` tune the durations. Additionally, before inserting each
+gap the synthesized chunk is:
+
+1. **Trimmed** of leading/trailing near-silence (`--trim-threshold`,
+   default 0.005), so the typed gap above is the *only* silence the
+   listener hears at that boundary — no stacked model tail.
+2. **Fade in/out** applied linearly over `--fade-ms` (default 10 ms) at
+   both ends, which removes the clicks you'd otherwise hear when
+   non-zero-crossing samples sit next to inserted silence (particularly
+   audible at long chapter gaps).
+
+In `--ipa` mode, structural parsing still runs: preserve blank lines in
+your piped IPA to get paragraph/section gaps, or use `# ` / `## `
+prefixes to mark chapter/section boundaries.
+
 ### Streaming to stdout
 
 Passing `-o -` writes the WAV to stdout so the output can be piped
@@ -260,6 +321,12 @@ storytime --list-voices
 | `--assets PATH` | `../assets` | location of exported assets |
 | `--list-voices` | — | list available voices and exit |
 | `-o, --output PATH` | *(unset)* | write WAV here; `-` streams WAV to stdout; if omitted, play to default output device |
+| `--chunk-gap-ms` | `120` | silence between chunker-forced splits inside a paragraph |
+| `--paragraph-gap-ms` | `400` | silence between paragraphs (one blank line) |
+| `--section-gap-ms` | `700` | silence between sections (≥2 blank lines or `## ` heading) |
+| `--chapter-gap-ms` | `1200` | silence between chapters (`# ` heading) |
+| `--fade-ms` | `10` | linear fade-in/out at every chunk seam (avoids clicks) |
+| `--trim-threshold` | `0.005` | amplitude below which per-chunk leading/trailing silence is trimmed (`0` disables) |
 
 ### Voices
 
