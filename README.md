@@ -208,6 +208,26 @@ espeak-ng -q --ipa=3 -v en-us "Hello, world." \
   | storytime --ipa -o hello.wav
 ```
 
+### Punctuation prosody
+
+Kokoro's training vocab includes `; : , . ! ? — … " ( )` as first-class
+tokens, and the model is trained to produce pauses and intonation
+changes on them. espeak-ng in `--ipa=3` mode, however, silently
+**strips every one of these** from its output, so a naive text →
+espeak → Kokoro pipeline loses all punctuation prosody.
+
+To fix this without switching to Misaki (the upstream Python G2P,
+which would mean adding a Python runtime dependency), `storytime`
+splits each block on preserved-punctuation boundaries, feeds only the
+text segments to espeak-ng (one per line), and interleaves the
+punctuation back into the IPA output before tokenizing. One espeak
+invocation per block, same as a naive pass-through — but now `?`,
+`:`, `;`, `—`, `…`, commas, and quote marks all reach the model and
+drive its prosody.
+
+If you see unnaturally flat delivery on a specific passage, check the
+input punctuation is present; the model uses it heavily.
+
 ### Structural pauses
 
 Kokoro produces natural prosody (short pauses on `.`/`,`/`;`/etc.) inside a

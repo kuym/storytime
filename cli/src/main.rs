@@ -417,30 +417,113 @@ fn hard_split(s: &str, vocab: &HashMap<String, i64>, max_tokens: usize) -> Vec<S
     out
 }
 
+/// Punctuation characters preserved across the espeak-ng call so they
+/// reach Kokoro's token stream. espeak-ng with `--ipa=3` silently strips
+/// all of these, but they are first-class vocab entries in Kokoro's
+/// config and the model is trained to produce prosody on them. Missing
+/// punctuation is the single largest contributor to "flat" / "monotone"
+/// synthesis on longer inputs.
+///
+/// Chars here match Misaki's `PUNCTS` set (the upstream Python G2P used
+/// by Kokoro's authors) plus parentheses, which are also in the vocab.
+const PRESERVED_PUNCT: &str = ";:,.!?—…\"()\u{201C}\u{201D}";
+
+/// Run espeak-ng for grapheme->IPA conversion, preserving punctuation.
+///
+/// The strategy is: split the input on every preserved punctuation
+/// character, send only the text segments to espeak-ng (one per line),
+/// read one IPA line back per segment, then interleave the punctuation
+/// back into the output. One espeak invocation per call, same as a
+/// naive pass-through — but the resulting IPA contains `?`, `:`, `;`,
+/// etc., which espeak would otherwise drop.
 fn run_espeak(text: &str) -> Result<String> {
-    let mut child = Command::new("espeak-ng")
-        .args(["-q", "--ipa=3", "-v", "en-us"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn espeak-ng (install it or use --ipa)")?;
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(text.as_bytes())?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        bail!("espeak-ng failed: {}", String::from_utf8_lossy(&out.stderr));
+    #[derive(Debug)]
+    enum Piece<'a> {
+        Text(&'a str),
+        Punct(char),
     }
-    Ok(String::from_utf8(out.stdout)?
-        .chars()
-        .filter(|c| !c.is_control() || *c == '\n')
-        .collect::<String>()
-        .replace('\n', " ")
-        .trim()
-        .to_string())
+
+    // 1. Split input on preserved-punctuation boundaries.
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut cur = 0usize;
+    for (i, ch) in text.char_indices() {
+        if PRESERVED_PUNCT.contains(ch) {
+            if cur < i {
+                pieces.push(Piece::Text(&text[cur..i]));
+            }
+            pieces.push(Piece::Punct(ch));
+            cur = i + ch.len_utf8();
+        }
+    }
+    if cur < text.len() {
+        pieces.push(Piece::Text(&text[cur..]));
+    }
+
+    // 2. Collect non-empty text segments, one per line, for espeak-ng.
+    //    espeak-ng emits one IPA line per input line in --ipa=3 mode, which
+    //    gives us a clean 1:1 mapping back to the segment list.
+    let text_segments: Vec<&str> = pieces
+        .iter()
+        .filter_map(|p| match p {
+            Piece::Text(s) if !s.trim().is_empty() => Some(*s),
+            _ => None,
+        })
+        .collect();
+
+    let ipa_lines: Vec<String> = if text_segments.is_empty() {
+        Vec::new()
+    } else {
+        let joined = text_segments
+            .iter()
+            .map(|s| s.trim())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut child = Command::new("espeak-ng")
+            .args(["-q", "--ipa=3", "-v", "en-us"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to spawn espeak-ng (install it or use --ipa)")?;
+        child.stdin.as_mut().unwrap().write_all(joined.as_bytes())?;
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            bail!("espeak-ng failed: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        String::from_utf8(out.stdout)?
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+
+    // 3. Interleave punctuation back into the IPA stream. Add a space
+    //    after each punct when more text follows, so natural word spacing
+    //    survives the rebuild (espeak output has no leading space).
+    let mut result = String::new();
+    let mut ipa_iter = ipa_lines.into_iter();
+    for (i, piece) in pieces.iter().enumerate() {
+        match piece {
+            Piece::Text(s) => {
+                if s.trim().is_empty() {
+                    continue;
+                }
+                if let Some(ipa) = ipa_iter.next() {
+                    result.push_str(&ipa);
+                }
+            }
+            Piece::Punct(c) => {
+                result.push(*c);
+                let more_text_follows = pieces[i + 1..]
+                    .iter()
+                    .any(|p| matches!(p, Piece::Text(s) if !s.trim().is_empty()));
+                if more_text_follows {
+                    result.push(' ');
+                }
+            }
+        }
+    }
+    Ok(result.trim().to_string())
 }
 
 struct Voice {
