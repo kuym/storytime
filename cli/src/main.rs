@@ -978,14 +978,13 @@ fn main() -> Result<()> {
         samples.extend_from_slice(audio);
     }
 
-    eprintln!(
-        "storytime: {} samples total @ {} Hz ({:.2}s)",
-        samples.len(),
-        NATIVE_SR,
-        samples.len() as f32 / NATIVE_SR as f32
-    );
-
     let resampled = resample(&samples, NATIVE_SR, args.sample_rate)?;
+    eprintln!(
+        "storytime: {} samples @ {} Hz ({:.2}s)",
+        resampled.len(),
+        args.sample_rate,
+        resampled.len() as f32 / args.sample_rate as f32
+    );
     match &args.output {
         Some(path) if path.as_os_str() == "-" => {
             let stdout = std::io::stdout();
