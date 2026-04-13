@@ -64,6 +64,11 @@ enum BitDepth {
                   would emit), and espeak-ng is not required."
 )]
 struct Args {
+    /// Input text (or IPA with --ipa) file path. If omitted or `-`, read
+    /// from stdin.
+    #[arg(short = 'i', long)]
+    input: Option<PathBuf>,
+
     /// Voice name (see --list-voices), e.g. af_bella.
     #[arg(long, default_value = "af_heart")]
     voice: String,
@@ -156,6 +161,24 @@ struct TokensFile {
     vocab: HashMap<String, i64>,
     #[allow(dead_code)]
     n_token: usize,
+}
+
+/// Read input text from a file path, or stdin if the path is `None` or `-`.
+fn read_input(path: Option<&Path>) -> Result<String> {
+    match path {
+        None => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            Ok(buf)
+        }
+        Some(p) if p.as_os_str() == "-" => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            Ok(buf)
+        }
+        Some(p) => fs::read_to_string(p)
+            .with_context(|| format!("reading input file {}", p.display())),
+    }
 }
 
 /// Resolve the CoreML compiled-model cache directory.
@@ -731,10 +754,9 @@ fn main() -> Result<()> {
         return list_voices(&assets);
     }
 
-    let mut stdin_buf = String::new();
-    std::io::stdin().read_to_string(&mut stdin_buf)?;
-    if stdin_buf.trim().is_empty() {
-        bail!("stdin was empty");
+    let input_text = read_input(args.input.as_deref())?;
+    if input_text.trim().is_empty() {
+        bail!("input was empty");
     }
 
     let vocab = load_tokens(&assets)?;
@@ -743,7 +765,7 @@ fn main() -> Result<()> {
 
     // Parse structure first so paragraph / section / chapter breaks survive
     // espeak-ng (which would otherwise flatten all whitespace).
-    let blocks = parse_structure(&stdin_buf);
+    let blocks = parse_structure(&input_text);
     if blocks.is_empty() {
         bail!("no content after structural parsing");
     }

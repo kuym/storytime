@@ -191,6 +191,9 @@ Skip this if you'll always pipe pre-computed IPA via `--ipa`.
 ### Basic
 
 ```sh
+# Read from a file instead of stdin
+storytime -i story.txt -o story.wav
+
 # Play directly through the speakers (no -o)
 echo "Hello, world." | storytime --voice af_bella
 
@@ -316,6 +319,7 @@ storytime --list-voices
 
 | flag | default | description |
 |---|---|---|
+| `-i, --input PATH` | *(stdin)* | read input from file; `-` or omitted means stdin |
 | `--voice NAME` | `af_heart` | voice name from `--list-voices` |
 | `--sample-rate HZ` | `24000` | output sample rate; model native is 24 kHz |
 | `--bit-depth {16,24,32,float32}` | `16` | PCM bit depth |
