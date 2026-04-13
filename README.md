@@ -255,13 +255,26 @@ get the same pause as a comma.
 `storytime` parses the input into structural blocks *before* phonemization
 and inserts a typed silence gap at each boundary:
 
-| boundary | how it's detected | default gap |
+| boundary | how it's detected | default |
 |---|---|---|
-| paragraph | one blank line between non-empty lines | 400 ms |
-| section | two or more blank lines, or a `## `/`### ` heading | 700 ms |
-| chapter | a `# ` heading | 1200 ms |
-| quote | entry to / exit from a `"..."` or `"..."` span | 250 ms |
-| within-paragraph chunk split | forced by the 510-token limit | 120 ms |
+| paragraph | one blank line between non-empty lines | inline marker `" — — — "` |
+| section | two or more blank lines, or a `## `/`### ` heading | inline marker `" — — — — — "` |
+| chapter | a `# ` heading | 1200 ms silence |
+| quote | entry to / exit from a `"..."` span | rely on quote tokens |
+| within-paragraph chunk split | forced by the 510-token limit | 120 ms silence |
+
+**Two mechanisms** drive pauses: **textual markers** (inserted into the
+text before phonemization so Kokoro generates the pause itself from its
+trained prosody) and **explicit silence** (zero samples spliced in after
+synthesis). Markers are strictly faster because multiple blocks merge
+into a single inference call — Kokoro has a fixed per-call overhead
+that amortizes over longer inputs, so collapsing 7 short blocks into
+one ~500-token call is visibly faster than 7 short calls.
+
+By default paragraph and section boundaries use markers (no inference
+split), quote boundaries use neither (the `"` tokens alone drive
+prosody), and chapter boundaries use explicit silence (the pause is
+too long to express cleanly as inline punctuation).
 
 Markdown heading markers (`# `, `## `, `### `) are stripped from the spoken
 text but their presence upgrades the boundary strength. So this input:
@@ -375,10 +388,12 @@ storytime --list-voices
 | `--list-voices` | — | list available voices and exit |
 | `-o, --output PATH` | *(unset)* | write WAV here; `-` streams WAV to stdout; if omitted, play to default output device |
 | `--chunk-gap-ms` | `120` | silence between chunker-forced splits inside a paragraph |
-| `--quote-gap-ms` | `250` | silence on entry to / exit from a quoted span (`0` disables) |
-| `--paragraph-gap-ms` | `400` | silence between paragraphs (one blank line) |
-| `--section-gap-ms` | `700` | silence between sections (≥2 blank lines or `## ` heading) |
+| `--quote-gap-ms` | `0` | silence at quote transitions; `> 0` forces a quote-aware split |
+| `--paragraph-gap-ms` | `0` | silence between paragraphs; `> 0` forces a split (overrides marker) |
+| `--section-gap-ms` | `0` | silence between sections; `> 0` forces a split |
 | `--chapter-gap-ms` | `1200` | silence between chapters (`# ` heading) |
+| `--paragraph-marker` | `" — — — "` | inline marker inserted between paragraphs when `--paragraph-gap-ms` is 0 |
+| `--section-marker` | `" — — — — — "` | inline marker inserted between sections when `--section-gap-ms` is 0 |
 | `--fade-ms` | `10` | linear fade-in/out at every chunk seam (avoids clicks) |
 | `--trim-threshold` | `0.005` | amplitude below which per-chunk leading/trailing silence is trimmed (`0` disables) |
 | `--coreml-cache PATH` | `~/Library/Caches/storytime/coreml` | where CoreML stores its compiled model between runs |

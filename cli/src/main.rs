@@ -99,25 +99,42 @@ struct Args {
     list_voices: bool,
 
     /// Silence inserted between chunker-forced splits within a paragraph, in ms.
+    /// (Chunker splits have no textual equivalent, so silence is used.)
     #[arg(long, default_value_t = 120)]
     chunk_gap_ms: u32,
 
     /// Silence inserted on entry to and exit from a quoted span (dialogue),
-    /// in ms. Set to 0 to disable quote-aware pauses.
-    #[arg(long, default_value_t = 250)]
+    /// in ms. Default 0: the quote characters themselves drive prosody via
+    /// Kokoro's trained punctuation tokens, and narration/dialogue stays in
+    /// one inference call for better throughput. Set > 0 to re-enable
+    /// explicit quote-aware pauses.
+    #[arg(long, default_value_t = 0)]
     quote_gap_ms: u32,
 
-    /// Silence inserted between paragraphs (separated by a blank line), in ms.
-    #[arg(long, default_value_t = 400)]
+    /// Silence inserted between paragraphs (blank-line separated), in ms.
+    /// Default 0: a textual pause marker (`--paragraph-marker`) is inserted
+    /// instead and Kokoro generates the pause from its own learned prosody.
+    #[arg(long, default_value_t = 0)]
     paragraph_gap_ms: u32,
 
-    /// Silence inserted between sections (multiple blank lines or `## ` heading), in ms.
-    #[arg(long, default_value_t = 700)]
+    /// Silence inserted between sections (≥2 blank lines or `## ` heading), in ms.
+    /// Default 0: a marker (`--section-marker`) is inserted instead.
+    #[arg(long, default_value_t = 0)]
     section_gap_ms: u32,
 
     /// Silence inserted between chapters (`# ` heading), in ms.
     #[arg(long, default_value_t = 1200)]
     chapter_gap_ms: u32,
+
+    /// Textual pause marker inserted between paragraphs when `--paragraph-gap-ms` is 0.
+    /// Uses Kokoro's own em-dash token (id 9) so the model generates the pause.
+    #[arg(long, default_value_t = String::from(" — — — "))]
+    paragraph_marker: String,
+
+    /// Textual pause marker inserted between sections when `--section-gap-ms` is 0.
+    #[arg(long, default_value_t = String::from(" — — — — — "))]
+    section_marker: String,
+
 
     /// Linear fade-in/out applied at every chunk seam, in ms (avoids clicks).
     #[arg(long, default_value_t = 10)]
@@ -1008,53 +1025,85 @@ fn main() -> Result<()> {
     // amount of silence between each.
     let mut pieces: Vec<(Boundary, Vec<f32>)> = Vec::new();
 
-    // Flatten blocks into quote-aware units: each block is split at every
-    // double-quote boundary so narration/dialogue transitions get an extra
-    // typed pause. The first unit of a block carries the block's own gap
-    // (paragraph/section/chapter); subsequent units within the same block
-    // use the Quote gap.
-    struct Unit<'a> {
+    // Flatten blocks into units. A block becomes one unit unless the user
+    // has asked for explicit quote-aware silence (--quote-gap-ms > 0), in
+    // which case it's split at quote boundaries into multiple units.
+    struct Unit {
         text: String,
         gap_before: Boundary,
-        block_idx: usize,
-        block_count: usize,
-        within_block_idx: usize,
-        within_block_count: usize,
-        block: &'a Block,
     }
     let mut units: Vec<Unit> = Vec::new();
-    for (block_idx, block) in blocks.iter().enumerate() {
-        // Normalize before quote-splitting so straight `"` pairs become
-        // curly open/close (which split_quotes treats as unambiguous
-        // delimiters) and `...` becomes `…` (a dedicated vocab token).
+    for block in blocks.iter() {
         let normalized = normalize_punctuation(&block.text);
         let sub_pieces = if args.quote_gap_ms > 0 {
             split_quotes(&normalized)
         } else {
             vec![normalized]
         };
-        let count = sub_pieces.len();
         for (i, sub) in sub_pieces.into_iter().enumerate() {
             let gap = if i == 0 { block.gap_before } else { Boundary::Quote };
-            units.push(Unit {
-                text: sub,
-                gap_before: gap,
-                block_idx,
-                block_count: blocks.len(),
-                within_block_idx: i,
-                within_block_count: count,
-                block,
-            });
+            units.push(Unit { text: sub, gap_before: gap });
         }
     }
-    // Silence the unused-field warnings for `block` — it's kept for clarity.
-    let _ = &units.first().map(|u| u.block);
 
-    for unit in &units {
-        let ipa = if args.ipa {
-            unit.text.clone()
+    // Group consecutive units that are separated by a "soft" boundary
+    // (Paragraph / Section / Quote) whose silence gap is zero. Adjacent
+    // units in the same group are concatenated with a textual pause
+    // marker so Kokoro generates the pause itself — this reduces the
+    // number of inference calls substantially (fewer, longer inputs
+    // amortize the model's fixed per-call overhead). Boundaries with
+    // gap_ms > 0, Chapter, and Chunk always force a new group.
+    struct Group {
+        text: String,
+        gap_before: Boundary,
+    }
+    let paragraph_marker = &args.paragraph_marker;
+    let section_marker = &args.section_marker;
+    let gap_ms_for = |b: Boundary| -> u32 {
+        match b {
+            Boundary::None => 0,
+            Boundary::Chunk => args.chunk_gap_ms,
+            Boundary::Quote => args.quote_gap_ms,
+            Boundary::Paragraph => args.paragraph_gap_ms,
+            Boundary::Section => args.section_gap_ms,
+            Boundary::Chapter => args.chapter_gap_ms,
+        }
+    };
+    let mut groups: Vec<Group> = Vec::new();
+    for unit in units {
+        let soft = matches!(
+            unit.gap_before,
+            Boundary::Paragraph | Boundary::Section | Boundary::Quote
+        );
+        let ms = gap_ms_for(unit.gap_before);
+        if groups.is_empty() || !soft || ms > 0 {
+            groups.push(Group {
+                text: unit.text,
+                gap_before: unit.gap_before,
+            });
         } else {
-            run_espeak(&unit.text)?
+            let marker = match unit.gap_before {
+                Boundary::Paragraph => paragraph_marker.as_str(),
+                Boundary::Section => section_marker.as_str(),
+                _ => " ",
+            };
+            let last = groups.last_mut().unwrap();
+            last.text.push_str(marker);
+            last.text.push_str(&unit.text);
+        }
+    }
+
+    eprintln!(
+        "storytime: {} block(s) -> {} group(s) after marker merging",
+        blocks.len(),
+        groups.len()
+    );
+
+    for (group_idx, group) in groups.iter().enumerate() {
+        let ipa = if args.ipa {
+            group.text.clone()
+        } else {
+            run_espeak(&group.text)?
         };
         let chunks = chunk_ipa(&ipa, &vocab, max_tokens);
         if chunks.is_empty() {
@@ -1068,8 +1117,6 @@ fn main() -> Result<()> {
             let style = select_style(&voice, tokens.len());
             let audio = synthesize_chunk(&mut session, &tokens, style, args.speed)?;
 
-            // Trim model-produced leading/trailing silence so the explicit
-            // typed gap below is the only thing the listener perceives.
             let trimmed = trim_silence(&audio, args.trim_threshold).to_vec();
             let mut buf = trimmed;
             apply_fade(&mut buf, fade);
@@ -1077,17 +1124,15 @@ fn main() -> Result<()> {
             let gap_before = if pieces.is_empty() {
                 Boundary::None
             } else if chunk_idx == 0 {
-                unit.gap_before
+                group.gap_before
             } else {
                 Boundary::Chunk
             };
 
             eprintln!(
-                "storytime: block {}/{} piece {}/{} chunk {}/{}: {} tokens -> {} samples ({:?} gap)",
-                unit.block_idx + 1,
-                unit.block_count,
-                unit.within_block_idx + 1,
-                unit.within_block_count,
+                "storytime: group {}/{} chunk {}/{}: {} tokens -> {} samples ({:?} gap)",
+                group_idx + 1,
+                groups.len(),
                 chunk_idx + 1,
                 chunks.len(),
                 tokens.len(),
