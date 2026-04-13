@@ -21,7 +21,9 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use hound::{SampleFormat, WavSpec, WavWriter};
-use ort::execution_providers::CoreMLExecutionProvider;
+use ort::execution_providers::coreml::{
+    CoreMLComputeUnits, CoreMLExecutionProvider, CoreMLModelFormat,
+};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 
@@ -116,6 +118,15 @@ struct Args {
     #[arg(long, default_value_t = 0.005)]
     trim_threshold: f32,
 
+    /// Directory to cache the CoreML-compiled model between runs.
+    /// Defaults to `$HOME/Library/Caches/storytime/coreml` on macOS.
+    #[arg(long)]
+    coreml_cache: Option<PathBuf>,
+
+    /// Disable the CoreML compiled-model cache (forces recompilation each run).
+    #[arg(long)]
+    no_coreml_cache: bool,
+
     /// Output WAV path. If omitted, audio plays directly to the default
     /// output device via the OS-native audio API. Use `-` to stream the
     /// WAV to stdout.
@@ -145,6 +156,25 @@ struct TokensFile {
     vocab: HashMap<String, i64>,
     #[allow(dead_code)]
     n_token: usize,
+}
+
+/// Resolve the CoreML compiled-model cache directory.
+/// Returns `Ok(None)` when caching is explicitly disabled.
+fn resolve_coreml_cache(args: &Args) -> Result<Option<PathBuf>> {
+    if args.no_coreml_cache {
+        return Ok(None);
+    }
+    if let Some(p) = args.coreml_cache.as_ref() {
+        return Ok(Some(p.clone()));
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let default = if cfg!(target_os = "macos") {
+        home.map(|h| h.join("Library/Caches/storytime/coreml"))
+    } else {
+        // CoreML only runs on Apple platforms; elsewhere the flag is a no-op.
+        None
+    };
+    Ok(default)
 }
 
 fn assets_dir(cli_override: Option<&Path>) -> Result<PathBuf> {
@@ -725,12 +755,36 @@ fn main() -> Result<()> {
     );
 
     // Build ONNX session with CoreML EP (falls back to CPU automatically).
+    // Tuning choices:
+    //   - NeuralNetwork format: the MLProgram format trips an MPSGraph
+    //     verification error on Kokoro's dynamic-shape matmuls on Apple
+    //     Silicon (mps.matmul contracting-dim mismatch under dynamic token
+    //     lengths). NeuralNetwork is the older but stable path.
+    //   - compute units All: lets CoreML schedule across CPU + GPU + ANE.
+    //   - model cache dir: CoreML otherwise recompiles the model on every
+    //     session build (several seconds on a cold run). Caching makes
+    //     subsequent starts fast.
+    //   - fp16 accumulation on GPU: typically faster, negligible quality cost.
     ort::init().with_name("storytime").commit().map_err(ort_err)?;
+
+    let cache_dir = resolve_coreml_cache(&args)?;
+    let mut coreml = CoreMLExecutionProvider::default()
+        .with_model_format(CoreMLModelFormat::NeuralNetwork)
+        .with_compute_units(CoreMLComputeUnits::All)
+        .with_low_precision_accumulation_on_gpu(true);
+    if let Some(dir) = cache_dir.as_ref() {
+        fs::create_dir_all(dir)?;
+        coreml = coreml.with_model_cache_dir(dir.display().to_string());
+        eprintln!("storytime: coreml cache: {}", dir.display());
+    } else {
+        eprintln!("storytime: coreml cache disabled");
+    }
+
     let mut session = Session::builder()
         .map_err(ort_err)?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(ort_err)?
-        .with_execution_providers([CoreMLExecutionProvider::default().build()])
+        .with_execution_providers([coreml.build()])
         .map_err(ort_err)?
         .commit_from_file(assets.join("kokoro.onnx"))
         .map_err(ort_err)?;

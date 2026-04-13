@@ -20,8 +20,11 @@ plain float32 voice tensors that the Rust CLI consumes.
   (AudioToolbox's AudioQueue on macOS, ALSA on Linux) — no third-party
   audio crates.
 - **Local & offline.** Model, voices, and runtime all live on disk. No network.
-- **Hardware-accelerated.** Runs on the Apple Neural Engine / GPU via CoreML,
-  with automatic CPU fallback.
+- **Hardware-accelerated.** Runs on the Apple Neural Engine / GPU via CoreML
+  (`MLComputeUnits=All`, fp16 GPU accumulation), with automatic CPU fallback
+  for ops CoreML doesn't cover. The compiled CoreML model is cached between
+  runs in `~/Library/Caches/storytime/coreml`, cutting cold-start by ~50%
+  after the first invocation.
 - **Two input modes.**
   - *Text mode* (default): stdin is raw text; the tool shells out to
     `espeak-ng` for grapheme-to-phoneme conversion.
@@ -327,6 +330,8 @@ storytime --list-voices
 | `--chapter-gap-ms` | `1200` | silence between chapters (`# ` heading) |
 | `--fade-ms` | `10` | linear fade-in/out at every chunk seam (avoids clicks) |
 | `--trim-threshold` | `0.005` | amplitude below which per-chunk leading/trailing silence is trimmed (`0` disables) |
+| `--coreml-cache PATH` | `~/Library/Caches/storytime/coreml` | where CoreML stores its compiled model between runs |
+| `--no-coreml-cache` | off | disable the cache (forces recompilation each run) |
 
 ### Voices
 
