@@ -102,6 +102,11 @@ struct Args {
     #[arg(long, default_value_t = 120)]
     chunk_gap_ms: u32,
 
+    /// Silence inserted on entry to and exit from a quoted span (dialogue),
+    /// in ms. Set to 0 to disable quote-aware pauses.
+    #[arg(long, default_value_t = 250)]
+    quote_gap_ms: u32,
+
     /// Silence inserted between paragraphs (separated by a blank line), in ms.
     #[arg(long, default_value_t = 400)]
     paragraph_gap_ms: u32,
@@ -144,9 +149,10 @@ struct Args {
 enum Boundary {
     None = 0,
     Chunk = 1,
-    Paragraph = 2,
-    Section = 3,
-    Chapter = 4,
+    Quote = 2,
+    Paragraph = 3,
+    Section = 4,
+    Chapter = 5,
 }
 
 /// One structural block of input — a paragraph of running text, or a heading.
@@ -635,11 +641,68 @@ fn gap_samples_for(b: Boundary, args: &Args, sr: u32) -> usize {
     let ms = match b {
         Boundary::None => 0,
         Boundary::Chunk => args.chunk_gap_ms,
+        Boundary::Quote => args.quote_gap_ms,
         Boundary::Paragraph => args.paragraph_gap_ms,
         Boundary::Section => args.section_gap_ms,
         Boundary::Chapter => args.chapter_gap_ms,
     };
     (sr as usize * ms as usize) / 1000
+}
+
+/// Split a block of text into pieces at every transition across a
+/// double-quote boundary. Straight `"` toggles the inside/outside state;
+/// curly `\u{201C}` / `\u{201D}` are treated as unambiguous open/close.
+/// Single quotes are intentionally NOT handled because they're
+/// indistinguishable from apostrophes in plain text.
+///
+/// The quote characters themselves are retained with the quoted piece,
+/// so the model still sees them in its phoneme stream and produces the
+/// usual punctuation-driven prosody — the inserted Quote gap is purely
+/// additive and gives dialogue the extra "beat" a narrator would use.
+fn split_quotes(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut inside = false;
+
+    let flush = |cur: &mut String, out: &mut Vec<String>| {
+        let t = cur.trim();
+        if !t.is_empty() {
+            out.push(t.to_string());
+        }
+        cur.clear();
+    };
+
+    for ch in text.chars() {
+        match ch {
+            '"' => {
+                if !inside {
+                    flush(&mut cur, &mut out);
+                    cur.push(ch);
+                    inside = true;
+                } else {
+                    cur.push(ch);
+                    flush(&mut cur, &mut out);
+                    inside = false;
+                }
+            }
+            '\u{201C}' => {
+                flush(&mut cur, &mut out);
+                cur.push(ch);
+                inside = true;
+            }
+            '\u{201D}' => {
+                cur.push(ch);
+                flush(&mut cur, &mut out);
+                inside = false;
+            }
+            _ => cur.push(ch),
+        }
+    }
+    flush(&mut cur, &mut out);
+    if out.is_empty() {
+        out.push(text.trim().to_string());
+    }
+    out
 }
 
 /// Trim leading/trailing samples whose magnitude is below `threshold`.
@@ -817,11 +880,49 @@ fn main() -> Result<()> {
     // amount of silence between each.
     let mut pieces: Vec<(Boundary, Vec<f32>)> = Vec::new();
 
+    // Flatten blocks into quote-aware units: each block is split at every
+    // double-quote boundary so narration/dialogue transitions get an extra
+    // typed pause. The first unit of a block carries the block's own gap
+    // (paragraph/section/chapter); subsequent units within the same block
+    // use the Quote gap.
+    struct Unit<'a> {
+        text: String,
+        gap_before: Boundary,
+        block_idx: usize,
+        block_count: usize,
+        within_block_idx: usize,
+        within_block_count: usize,
+        block: &'a Block,
+    }
+    let mut units: Vec<Unit> = Vec::new();
     for (block_idx, block) in blocks.iter().enumerate() {
-        let ipa = if args.ipa {
-            block.text.clone()
+        let sub_pieces = if args.quote_gap_ms > 0 {
+            split_quotes(&block.text)
         } else {
-            run_espeak(&block.text)?
+            vec![block.text.clone()]
+        };
+        let count = sub_pieces.len();
+        for (i, sub) in sub_pieces.into_iter().enumerate() {
+            let gap = if i == 0 { block.gap_before } else { Boundary::Quote };
+            units.push(Unit {
+                text: sub,
+                gap_before: gap,
+                block_idx,
+                block_count: blocks.len(),
+                within_block_idx: i,
+                within_block_count: count,
+                block,
+            });
+        }
+    }
+    // Silence the unused-field warnings for `block` — it's kept for clarity.
+    let _ = &units.first().map(|u| u.block);
+
+    for unit in &units {
+        let ipa = if args.ipa {
+            unit.text.clone()
+        } else {
+            run_espeak(&unit.text)?
         };
         let chunks = chunk_ipa(&ipa, &vocab, max_tokens);
         if chunks.is_empty() {
@@ -844,15 +945,17 @@ fn main() -> Result<()> {
             let gap_before = if pieces.is_empty() {
                 Boundary::None
             } else if chunk_idx == 0 {
-                block.gap_before
+                unit.gap_before
             } else {
                 Boundary::Chunk
             };
 
             eprintln!(
-                "storytime: block {}/{} chunk {}/{}: {} tokens -> {} samples ({:?} gap)",
-                block_idx + 1,
-                blocks.len(),
+                "storytime: block {}/{} piece {}/{} chunk {}/{}: {} tokens -> {} samples ({:?} gap)",
+                unit.block_idx + 1,
+                unit.block_count,
+                unit.within_block_idx + 1,
+                unit.within_block_count,
                 chunk_idx + 1,
                 chunks.len(),
                 tokens.len(),

@@ -223,6 +223,7 @@ and inserts a typed silence gap at each boundary:
 | paragraph | one blank line between non-empty lines | 400 ms |
 | section | two or more blank lines, or a `## `/`### ` heading | 700 ms |
 | chapter | a `# ` heading | 1200 ms |
+| quote | entry to / exit from a `"..."` or `"..."` span | 250 ms |
 | within-paragraph chunk split | forced by the 510-token limit | 120 ms |
 
 Markdown heading markers (`# `, `## `, `### `) are stripped from the spoken
@@ -248,8 +249,16 @@ The end.
 700 ms ("A Pause") → 400 ms → paragraph → 1200 ms → "Chapter Two" → 400 ms
 → "The end." (and the `#` markers themselves are not spoken).
 
+Within any paragraph, the text is *also* split at every entry/exit of a
+double-quote span (straight `"..."` or curly `"..."`), so dialogue gets
+a small pause before and after the character's line — e.g. `She said,
+"Hello." Then she left.` becomes three pieces with Quote gaps at the
+transitions. Single quotes are not used as boundaries (they're
+indistinguishable from apostrophes in plain text).
+
 The flags `--paragraph-gap-ms`, `--section-gap-ms`, `--chapter-gap-ms`,
-`--chunk-gap-ms` tune the durations. Additionally, before inserting each
+`--chunk-gap-ms`, `--quote-gap-ms` tune the durations. Set any of them
+to `0` to disable that boundary type. Additionally, before inserting each
 gap the synthesized chunk is:
 
 1. **Trimmed** of leading/trailing near-silence (`--trim-threshold`,
@@ -329,6 +338,7 @@ storytime --list-voices
 | `--list-voices` | — | list available voices and exit |
 | `-o, --output PATH` | *(unset)* | write WAV here; `-` streams WAV to stdout; if omitted, play to default output device |
 | `--chunk-gap-ms` | `120` | silence between chunker-forced splits inside a paragraph |
+| `--quote-gap-ms` | `250` | silence on entry to / exit from a quoted span (`0` disables) |
 | `--paragraph-gap-ms` | `400` | silence between paragraphs (one blank line) |
 | `--section-gap-ms` | `700` | silence between sections (≥2 blank lines or `## ` heading) |
 | `--chapter-gap-ms` | `1200` | silence between chapters (`# ` heading) |
