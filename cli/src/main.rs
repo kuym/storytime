@@ -428,6 +428,51 @@ fn hard_split(s: &str, vocab: &HashMap<String, i64>, max_tokens: usize) -> Vec<S
 /// by Kokoro's authors) plus parentheses, which are also in the vocab.
 const PRESERVED_PUNCT: &str = ";:,.!?—…\"()\u{201C}\u{201D}";
 
+/// Normalize punctuation to the forms Kokoro's vocab prefers:
+///   - Runs of 3+ ASCII dots (`...`, `....`) collapse to a single `…`
+///     (U+2026), which Kokoro has as a dedicated token (ID 10).
+///   - Straight `"` characters are paired off into alternating curly
+///     `\u{201C}` (open) / `\u{201D}` (close), which are Kokoro's
+///     dedicated open/close tokens (IDs 14 and 15). Leaving them as
+///     straight `"` maps everything to a single undifferentiated token
+///     (ID 11) and loses the open/close distinction.
+///
+/// Applied before quote-aware splitting and before phonemization, so
+/// downstream code sees the normalized form.
+fn normalize_punctuation(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quote_open = true;
+    let mut dots = 0usize;
+
+    let flush_dots = |dots: &mut usize, out: &mut String| {
+        if *dots >= 3 {
+            out.push('\u{2026}');
+        } else {
+            for _ in 0..*dots {
+                out.push('.');
+            }
+        }
+        *dots = 0;
+    };
+
+    for ch in text.chars() {
+        if ch == '.' {
+            dots += 1;
+            continue;
+        }
+        flush_dots(&mut dots, &mut out);
+
+        if ch == '"' {
+            out.push(if quote_open { '\u{201C}' } else { '\u{201D}' });
+            quote_open = !quote_open;
+        } else {
+            out.push(ch);
+        }
+    }
+    flush_dots(&mut dots, &mut out);
+    out
+}
+
 /// Run espeak-ng for grapheme->IPA conversion, preserving punctuation.
 ///
 /// The strategy is: split the input on every preserved punctuation
@@ -979,10 +1024,14 @@ fn main() -> Result<()> {
     }
     let mut units: Vec<Unit> = Vec::new();
     for (block_idx, block) in blocks.iter().enumerate() {
+        // Normalize before quote-splitting so straight `"` pairs become
+        // curly open/close (which split_quotes treats as unambiguous
+        // delimiters) and `...` becomes `…` (a dedicated vocab token).
+        let normalized = normalize_punctuation(&block.text);
         let sub_pieces = if args.quote_gap_ms > 0 {
-            split_quotes(&block.text)
+            split_quotes(&normalized)
         } else {
-            vec![block.text.clone()]
+            vec![normalized]
         };
         let count = sub_pieces.len();
         for (i, sub) in sub_pieces.into_iter().enumerate() {

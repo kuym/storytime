@@ -208,6 +208,23 @@ espeak-ng -q --ipa=3 -v en-us "Hello, world." \
   | storytime --ipa -o hello.wav
 ```
 
+### Punctuation normalization
+
+Before anything else, each block's text is normalized to the forms
+Kokoro's vocab prefers:
+
+- **Ellipses.** Runs of three or more ASCII dots (`...`, `....`) are
+  collapsed to a single `…` (U+2026). Kokoro has a dedicated token
+  for `…`; leaving it as three separate `.` tokens gives three clipped
+  pauses instead of one sustained one.
+- **Quote pairs.** Straight `"` characters are paired off into
+  alternating curly `"` (open, U+201C) and `"` (close, U+201D).
+  Kokoro has distinct open/close tokens with different learned
+  prosody; mapping everything to the undifferentiated straight
+  `"` token loses that distinction.
+
+Input that already uses `…` or curly quotes passes through unchanged.
+
 ### Punctuation prosody
 
 Kokoro's training vocab includes `; : , . ! ? — … " ( )` as first-class
