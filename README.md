@@ -392,8 +392,8 @@ storytime --list-voices
 | `--paragraph-gap-ms` | `0` | silence between paragraphs; `> 0` forces a split (overrides marker) |
 | `--section-gap-ms` | `0` | silence between sections; `> 0` forces a split |
 | `--chapter-gap-ms` | `1200` | silence between chapters (`# ` heading) |
-| `--paragraph-marker` | `" — — — "` | inline marker inserted between paragraphs when `--paragraph-gap-ms` is 0 |
-| `--section-marker` | `" — — — — — "` | inline marker inserted between sections when `--section-gap-ms` is 0 |
+| `--paragraph-marker` | `". … "` | inline marker between paragraphs (period = sentence-ending prosody, ellipsis = sustained pause) |
+| `--section-marker` | `". … … "` | inline marker between sections |
 | `--fade-ms` | `10` | linear fade-in/out at every chunk seam (avoids clicks) |
 | `--trim-threshold` | `0.005` | amplitude below which per-chunk leading/trailing silence is trimmed (`0` disables) |
 | `--coreml-cache PATH` | `~/Library/Caches/storytime/coreml` | where CoreML stores its compiled model between runs |

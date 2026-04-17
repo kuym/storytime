@@ -127,12 +127,14 @@ struct Args {
     chapter_gap_ms: u32,
 
     /// Textual pause marker inserted between paragraphs when `--paragraph-gap-ms` is 0.
-    /// Uses Kokoro's own em-dash token (id 9) so the model generates the pause.
-    #[arg(long, default_value_t = String::from(" — — — "))]
+    /// Default `. … ` uses a period (sentence-ending prosody) plus an ellipsis
+    /// (sustained-pause token) so the model generates a clean pause rather
+    /// than vocalizing the marker.
+    #[arg(long, default_value_t = String::from(". \u{2026} "))]
     paragraph_marker: String,
 
     /// Textual pause marker inserted between sections when `--section-gap-ms` is 0.
-    #[arg(long, default_value_t = String::from(" — — — — — "))]
+    #[arg(long, default_value_t = String::from(". \u{2026} \u{2026} "))]
     section_marker: String,
 
 
@@ -850,18 +852,44 @@ fn split_quotes(text: &str) -> Vec<String> {
     out
 }
 
-/// Trim leading/trailing samples whose magnitude is below `threshold`.
-/// Returns an empty slice if nothing clears the threshold.
+/// Trim leading/trailing silence using windowed RMS energy.
+///
+/// Instead of reacting to the first individual sample above `threshold`,
+/// this requires a sliding window of WINDOW samples to have an RMS above
+/// `threshold`. This makes the onset detector immune to isolated spikes
+/// from the iSTFT decoder's settling noise, which are brief (a few
+/// samples) and don't sustain across a full window.
 fn trim_silence(samples: &[f32], threshold: f32) -> &[f32] {
     if threshold <= 0.0 || samples.is_empty() {
         return samples;
     }
-    let start = samples.iter().position(|s| s.abs() > threshold);
-    let end = samples.iter().rposition(|s| s.abs() > threshold);
-    match (start, end) {
-        (Some(s), Some(e)) => &samples[s..=e],
-        _ => &[],
+    const WINDOW: usize = 128; // ~5.3ms at 24kHz
+    let threshold_sq = threshold * threshold;
+
+    let rms_above = |start: usize| -> bool {
+        if start + WINDOW > samples.len() {
+            return false;
+        }
+        let sum_sq: f32 = samples[start..start + WINDOW]
+            .iter()
+            .map(|s| s * s)
+            .sum();
+        sum_sq / WINDOW as f32 > threshold_sq
+    };
+
+    let start = (0..samples.len().saturating_sub(WINDOW))
+        .find(|&i| rms_above(i))
+        .unwrap_or(samples.len());
+
+    let end = (0..samples.len().saturating_sub(WINDOW))
+        .rfind(|&i| rms_above(i))
+        .map(|i| (i + WINDOW).min(samples.len()))
+        .unwrap_or(start);
+
+    if start >= end {
+        return &[];
     }
+    &samples[start..end]
 }
 
 /// Apply an in-place linear fade-in over the first `fade` samples and a
