@@ -48,6 +48,38 @@ plain float32 voice tensors that the Rust CLI consumes.
 
 ---
 
+## Inference backends
+
+`storytime` supports two backends, selectable via `--backend`:
+
+| backend | flag | acceleration | weights format | notes |
+|---|---|---|---|---|
+| **ONNX** (default) | `--backend onnx` | CoreML EP (ANE/GPU/CPU) | `kokoro.onnx` (exported via `export.py`) | Stable, tested |
+| **MLX** | `--backend mlx` | Metal GPU (Apple Silicon) | safetensors (from [mlx-community/Kokoro-82M-bf16](https://huggingface.co/mlx-community/Kokoro-82M-bf16)) | Requires `--features mlx` at build time |
+
+### MLX backend setup
+
+```sh
+# 1. Build with MLX support (requires Xcode + macOS 14+)
+cd cli
+MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release --features mlx
+
+# 2. Download MLX-format weights
+# Place config.json + *.safetensors + voices/*.safetensors in assets/mlx/
+# or pass --mlx-weights /path/to/weights
+
+# 3. Run
+echo "Hello." | storytime --backend mlx --mlx-weights /path/to/Kokoro-82M-bf16
+```
+
+The MLX backend uses Apple's [MLX framework](https://github.com/ml-explore/mlx)
+(vendored as a git submodule at `vendor/mlx-swift`) for Metal GPU-accelerated
+inference. The Kokoro model architecture is ported to Swift using mlx-swift's
+`MLXNN` module, and exposed to Rust via `@_cdecl` C-callable bridge functions.
+
+Without `--features mlx`, `--backend mlx` prints an error and the binary
+has no MLX dependency at all.
+
 ## Architecture
 
 ```
