@@ -13,6 +13,7 @@ ipa=$(espeak-ng -q --ipa=3 -v en-us "$text" | tr '\n' ' ')
 out=$(mktemp /tmp/mlx_say_XXXXXX.wav)
 cd "$ROOT"
 echo "IPA: $ipa"
+echo ./spike/interp/target/release/interp --synth "$ipa" "$voice" "$out" "$speed"
 ./spike/interp/target/release/interp --synth "$ipa" "$voice" "$out" "$speed"
 echo "playing $out ..."
 afplay "$out" 2>/dev/null || echo "(afplay unavailable; file at $out)"

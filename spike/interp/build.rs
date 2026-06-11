@@ -18,6 +18,11 @@ fn main() {
     println!("cargo:rustc-link-lib=c++");
     println!("cargo:rustc-link-lib=framework=Accelerate");
     println!("cargo:rustc-link-lib=framework=Foundation");
+    // Metal GPU backend (libmlx built with MLX_BUILD_METAL=ON)
+    println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
+    println!("cargo:rustc-link-lib=framework=MetalPerformanceShadersGraph");
+    println!("cargo:rustc-link-lib=framework=QuartzCore");
 
     // --- bindgen ---
     // CommandLineTools libclang, in case clang-sys can't auto-locate it.

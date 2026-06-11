@@ -217,10 +217,13 @@ fn has(env: &Env, name: &str) -> bool {
 }
 
 fn load_safetensors(path: &str) -> HashMap<String, mlx_array> {
+    // Load + materialize weights on a CPU stream: the safetensors Load op has no
+    // GPU eval, so weights must be concrete before any GPU compute uses them.
+    let cpu = unsafe { mlx_default_cpu_stream_new() };
     let mut map = unsafe { mlx_map_string_to_array_new() };
     let mut meta = unsafe { mlx_map_string_to_string_new() };
     let cpath = std::ffi::CString::new(path).unwrap();
-    let rc = unsafe { mlx_load_safetensors(&mut map, &mut meta, cpath.as_ptr(), st()) };
+    let rc = unsafe { mlx_load_safetensors(&mut map, &mut meta, cpath.as_ptr(), cpu) };
     assert_eq!(rc, 0, "load_safetensors {path}");
     // Collect keys via the iterator, then fetch each value by name with `get`
     // (the iterator's value handle aliases across iterations).
@@ -240,6 +243,7 @@ fn load_safetensors(path: &str) -> HashMap<String, mlx_array> {
         let mut val = newarr();
         let rc = unsafe { mlx_map_string_to_array_get(&mut val, map, ck.as_ptr()) };
         assert_eq!(rc, 0, "map get {k}");
+        unsafe { mlx_array_eval(val) }; // materialize on CPU
         out.insert(k, val);
     }
     out
@@ -333,9 +337,115 @@ fn synth(ipa: &str, voice: &str, out: &str, speed: f32) {
     );
 }
 
+fn set_gpu(gpu: bool) {
+    unsafe {
+        STREAM = if gpu {
+            mlx_default_gpu_stream_new()
+        } else {
+            mlx_default_cpu_stream_new()
+        };
+    }
+}
+
+fn rel_diff(a: &[f32], b: &[f32]) -> f64 {
+    let mut se = 0f64;
+    let mut rs = 0f64;
+    for i in 0..a.len() {
+        let d = a[i] as f64 - b[i] as f64;
+        se += d * d;
+        rs += (a[i] as f64) * (a[i] as f64);
+    }
+    let rmse = (se / a.len() as f64).sqrt();
+    let rrms = (rs / a.len() as f64).sqrt();
+    if rrms > 1e-9 { rmse / rrms } else { rmse }
+}
+
+/// Run the full graph on the current stream, materializing every float output.
+/// Parity inputs + injected reference noise → identical across devices, so a
+/// later CPU-vs-GPU diff reflects only float-arithmetic differences.
+fn run_collect(
+    g: &Graph,
+    weights: &HashMap<String, mlx_array>,
+    refmap: &HashMap<String, mlx_array>,
+    inject: Option<&str>,
+) -> HashMap<String, Vec<f32>> {
+    let mut env: Env = HashMap::new();
+    for (k, v) in weights {
+        env.insert(k.clone(), Val::A(*v));
+    }
+    env.insert("input_ids".into(), Val::A(refmap["__input_ids"]));
+    env.insert("style".into(), Val::A(refmap["__style"]));
+    env.insert("speed".into(), Val::A(refmap["__speed"]));
+    let mut out = HashMap::new();
+    for n in &g.nodes {
+        let outs = run_node(n, &mut env, refmap);
+        for (name, a) in outs {
+            let a = match (inject, &a) {
+                (Some(sub), Val::A(arr))
+                    if dtype(*arr) == F32 && name.contains(sub) && refmap.contains_key(&name) =>
+                {
+                    Val::A(refmap[&name])
+                }
+                _ => a,
+            };
+            env.insert(name.clone(), a.clone());
+            if let Val::A(arr) = a {
+                if dtype(arr) == F32 {
+                    out.insert(name, read_f32(arr));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn compare_cpu_gpu(
+    g: &Graph,
+    weights: &HashMap<String, mlx_array>,
+    refmap: &HashMap<String, mlx_array>,
+) {
+    let inject = std::env::var("INJECT").ok();
+    let inj = inject.as_deref();
+    if let Some(s) = inj {
+        eprintln!("(injecting '{s}' from reference on both devices)");
+    }
+    eprintln!("CPU pass...");
+    set_gpu(false);
+    let cpu = run_collect(g, weights, refmap, inj);
+    eprintln!("GPU pass...");
+    set_gpu(true);
+    let gpu = run_collect(g, weights, refmap, inj);
+
+    let mut worst = 0f64;
+    let mut worst_name = String::new();
+    let mut n_big = 0u32;
+    for (name, c) in &cpu {
+        if let Some(gv) = gpu.get(name) {
+            if c.len() == gv.len() {
+                let rel = rel_diff(c, gv);
+                if rel > 1e-3 {
+                    n_big += 1;
+                }
+                if rel > worst {
+                    worst = rel;
+                    worst_name = name.clone();
+                }
+            }
+        }
+    }
+    let audio = rel_diff(&cpu["audio"], &gpu["audio"]);
+    println!("\n=== MLX CPU  vs  MLX GPU (same injected noise) ===");
+    println!("nodes compared:   {}", cpu.len());
+    println!("audio CPU vs GPU: rel {audio:.3e}");
+    println!("worst node:       rel {worst:.3e} ({worst_name})");
+    println!("nodes >1e-3:      {n_big}");
+}
+
 fn main() {
-    unsafe { STREAM = mlx_default_cpu_stream_new() };
     let args: Vec<String> = std::env::args().collect();
+    let gpu = args.iter().any(|a| a == "--gpu");
+    set_gpu(gpu);
+
     if args.get(1).map(|s| s == "--synth").unwrap_or(false) {
         unsafe { SYNTH = true };
         let speed = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1.0);
@@ -343,6 +453,12 @@ fn main() {
         return;
     }
     let g: Graph = load_graph();
+    if args.iter().any(|a| a == "--compare") {
+        let weights = load_safetensors("spike/art/weights.safetensors");
+        let refmap = load_safetensors("spike/art/ref.safetensors");
+        compare_cpu_gpu(&g, &weights, &refmap);
+        return;
+    }
     let weights = load_safetensors("spike/art/weights.safetensors");
     let refmap = load_safetensors("spike/art/ref.safetensors");
 

@@ -1,6 +1,6 @@
 # Plan: replace the Swift MLX backend with an ONNX→MLX graph interpreter
 
-Status: **Phase-1 interpreter runs the full graph on MLX CPU** · Last updated: 2026-06-10
+Status: **Phase-2 Metal GPU backend working; CPU≡GPU verified** · Last updated: 2026-06-10
 
 ## TL;DR
 
@@ -278,6 +278,34 @@ oscillator's conditioning.
 the Python lower step), array lifetime management (the spike leaks), use
 mlx_scatter/device ops instead of host fallbacks (Gather/Scatter/Slice/Pad/TopK),
 and wire it into the CLI behind `--backend mlx`.
+
+## Phase-2 results (Metal GPU)
+
+The interpreter targets a `mlx_stream`, so GPU was a small change: `--gpu`
+selects `mlx_default_gpu_stream_new()`, and `--compare` runs the whole graph on
+both devices (with identical injected noise) and diffs every node.
+
+**Build:** Xcode's `xcodebuild -downloadComponent MetalToolchain` initially
+failed (broken `DVTDownloads`/`IDESimulatorFoundation` plugin from a version
+skew); `xcodebuild -runFirstLaunch` repaired it, then the toolchain downloaded
+and mlx-c rebuilt with `MLX_BUILD_METAL=ON`. The interpreter's `build.rs` links
+Metal / MetalPerformanceShaders / MetalPerformanceShadersGraph / QuartzCore.
+One runtime fix: the safetensors `Load` op has no GPU eval, so weights are loaded
+and `mlx_array_eval`'d on a CPU stream before any GPU compute uses them.
+
+**Numeric equivalence — CPU ≡ GPU (Apple M2 Max):**
+- Deterministic graph (oscillator injected on both devices): audio **rel 5.4e-6**,
+  worst node 3.2e-5, **0 nodes >1e-3** — every op runs identically on Metal and CPU.
+- Full pipeline (oscillator computed): audio rel **1.7e-2** — same magnitude and
+  same root cause as CPU-vs-ONNX (CPU and GPU `sin`/`atan2` transcendentals differ
+  slightly; the `atan2` iSTFT phase amplifies it). Worst node is again the
+  `m_source` atan2 `Div`. Not a GPU bug.
+- GPU-synthesized audio is statistically identical to CPU (rms 0.0527, peak 0.325).
+
+**Performance:** GPU synth of a 27-token / 2.12s clip ran in **~1.3s wall vs ~22s
+on CPU (~17×)** — and that's *with* the spike's host-fallback ops (Gather/Scatter/
+Slice/Pad/LSTM/TopK read back to host every call, forcing CPU↔GPU syncs). Moving
+those to device ops would widen the gap further.
 
 ## Phased plan
 
