@@ -204,7 +204,7 @@ fn run_node(n: &Node, env: &mut Env) -> Vec<(String, Val)> {
             let oi: Vec<i32> = outs.iter().map(|&x| x as i32).collect();
             one(op!(mlx_broadcast_to, a, oi.as_ptr(), oi.len()))
         }
-        "Gather" => one(gather_host(env, n)),
+        "Gather" => one(gather_op(env, n)),
         "ConstantOfShape" => {
             let shp = read_i64(ga(env, &n.input[0]));
             let si: Vec<i32> = shp.iter().map(|&x| x as i32).collect();
@@ -931,6 +931,31 @@ fn loop_op(env: &Env, n: &Node) -> Vec<(String, Val)> {
         .collect()
 }
 
+// ONNX Gather = np.take(data, indices, axis). Float-data gathers (the big
+// feature/embedding lookups) run on the GPU via mlx_take_axis; the many tiny
+// integer gathers used for shape arithmetic stay on the host — their results
+// feed host shape logic anyway, and routing thousands of them through the GPU
+// would only add dispatches.
+fn gather_op(env: &Env, n: &Node) -> mlx_array {
+    let data = ga(env, &n.input[0]);
+    if dtype(data) != F32 {
+        return gather_host(env, n);
+    }
+    let idx = ga(env, &n.input[1]);
+    let rank = ndim(data) as i64;
+    let axis = {
+        let a = n.ai("axis", 0);
+        if a < 0 { a + rank } else { a }
+    };
+    let dim = shape(data)[axis as usize];
+    // Normalize ONNX negative indices (range [-dim, dim-1]) and cast to int32.
+    let idx = op!(mlx_astype, idx, INT32);
+    let neg = op!(mlx_less, idx, from_i32(&[0], &[]));
+    let wrapped = op!(mlx_add, idx, from_i32(&[dim], &[]));
+    let idx = op!(mlx_where, neg, wrapped, idx);
+    op!(mlx_take_axis, data, idx, axis as i32)
+}
+
 // ONNX Gather = np.take(data, indices, axis). Host implementation.
 fn gather_host(env: &Env, n: &Node) -> mlx_array {
     let data = ga(env, &n.input[0]);
@@ -1025,10 +1050,11 @@ fn host_slice(a: mlx_array, sss: &[(i64, i64, i64)]) -> mlx_array {
     }
 }
 
-// ONNX reflect pad (no edge repeat); mlx_pad doesn't support reflect.
+// ONNX reflect pad (no edge repeat); mlx_pad has no reflect mode. Stays on the
+// GPU: each padded axis is rebuilt as concat([reflected left cols, x, reflected
+// right cols]) — only `low+high` thin slices, no host round-trip of the (often
+// multi-megabyte) tensor.
 fn host_pad_reflect(a: mlx_array, low: &[i32], high: &[i32]) -> mlx_array {
-    let dims = shape(a);
-    let r = dims.len();
     let reflect = |x: i64, d: i64| -> i64 {
         if d == 1 {
             return 0;
@@ -1041,30 +1067,28 @@ fn host_pad_reflect(a: mlx_array, low: &[i32], high: &[i32]) -> mlx_array {
             period - m
         }
     };
-    let idxs: Vec<Vec<i64>> = (0..r)
-        .map(|i| {
-            let d = dims[i] as i64;
-            (0..d + low[i] as i64 + high[i] as i64)
-                .map(|o| reflect(o - low[i] as i64, d))
-                .collect()
-        })
-        .collect();
-    let out_dims: Vec<i32> = idxs.iter().map(|v| v.len() as i32).collect();
-    let out_strides = row_strides(&out_dims);
-    let in_strides = row_strides(&dims);
-    let total: usize = idxs.iter().map(|v| v.len()).product();
-    let d = read_f32(a);
-    let out: Vec<f32> = (0..total)
-        .map(|li| {
-            let mut flat = 0i64;
-            for i in 0..r {
-                let coord = (li as i64 / out_strides[i]) % out_dims[i] as i64;
-                flat += idxs[i][coord as usize] * in_strides[i];
-            }
-            d[flat as usize]
-        })
-        .collect();
-    from_f32(&out, &out_dims)
+    let mut cur = a;
+    let r = shape(a).len();
+    for ax in 0..r {
+        let (lo, hi) = (low[ax] as i64, high[ax] as i64);
+        if lo == 0 && hi == 0 {
+            continue;
+        }
+        let d = shape(cur)[ax] as i64;
+        let mut parts: Vec<mlx_array> = Vec::with_capacity((lo + 1 + hi) as usize);
+        for o in 0..lo {
+            let col = reflect(o - lo, d);
+            parts.push(slice_axis(cur, ax, col, col + 1));
+        }
+        parts.push(cur);
+        for o in 0..hi {
+            let col = reflect(d + o, d);
+            parts.push(slice_axis(cur, ax, col, col + 1));
+        }
+        let v = track_vec(unsafe { mlx_vector_array_new_data(parts.as_ptr(), parts.len()) });
+        cur = op!(mlx_concatenate_axis, v, ax as i32);
+    }
+    cur
 }
 
 fn row_strides(dims: &[i32]) -> Vec<i64> {

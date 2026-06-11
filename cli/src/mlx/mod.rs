@@ -380,6 +380,13 @@ impl MlxRuntime {
         env.insert("speed".into(), Val::A(speed_a));
 
         let wctx = &self.weight_ctx;
+        // Force evaluation every `eval_every` nodes (see below). Larger values
+        // submit more GPU work per flush (fewer sync round-trips) at the cost of
+        // a larger live working set; override via env for a memory/speed trade.
+        let eval_every: usize = std::env::var("STORYTIME_MLX_EVAL_EVERY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
         for (i, n) in self.graph.nodes.iter().enumerate() {
             // Start a fresh temp arena for this node. (Anything created before
             // the loop, e.g. input_ids, is untracked here but lives in env and
@@ -392,14 +399,11 @@ impl MlxRuntime {
             let outs = run_node(n, &mut env);
 
             // Collect this node's output arrays, then force evaluation every
-            // EVAL_EVERY nodes. Evaluating collapses the lazy graph so freed
+            // `eval_every` nodes. Evaluating collapses the lazy graph so freed
             // intermediates are actually released (otherwise the whole forward
-            // pass stays one graph that pins everything until the final read);
-            // batching a handful of nodes per eval cuts GPU sync round-trips so
-            // the GPU isn't stalled one op at a time. We only ever evaluate
-            // freshly-produced outputs (never a handle a later sweep may free),
-            // so this is safe regardless of cadence.
-            const EVAL_EVERY: usize = 8;
+            // pass stays one graph that pins everything until the final read).
+            // We only ever evaluate freshly-produced outputs (never a handle a
+            // later sweep may free), so this is safe at any cadence.
             let mut out_ctx: HashSet<usize> = HashSet::new();
             let mut out_arrays: Vec<mlx_array> = Vec::new();
             for (_, v) in &outs {
@@ -416,10 +420,13 @@ impl MlxRuntime {
                     }
                 }
             }
-            if i % EVAL_EVERY == 0 && !out_arrays.is_empty() {
+            if i % eval_every == 0 && !out_arrays.is_empty() {
                 unsafe {
+                    // Async eval: schedule the batch on the GPU and keep building
+                    // the next nodes on the CPU instead of blocking. Host reads
+                    // (read_f32/contig) and the final audio read sync as needed.
                     let vec = mlx_vector_array_new_data(out_arrays.as_ptr(), out_arrays.len());
-                    mlx_eval(vec);
+                    mlx_async_eval(vec);
                     mlx_vector_array_free(vec);
                 }
             }
