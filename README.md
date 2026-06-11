@@ -158,28 +158,36 @@ espeak-ng becomes optional when piping IPA from elsewhere.
 
 ### Prerequisites
 
-- macOS on Apple Silicon (tested on macOS 15, arm64). CoreML EP is used; an
-  Intel Mac would fall back to CPU only.
-- Rust toolchain (stable, ≥ 1.85).
-- Python 3.10+ with `pip` and `venv`.
-- The Kokoro-82M snapshot already downloaded locally. The export script
-  defaults to:
-  ```
-  /Users/kuy/.cache/huggingface/hub/models--hexgrad--Kokoro-82M/
-    snapshots/f3ff3571791e39611d31c381e3a41a3af07b4987
-  ```
-  Pass `--snapshot` to override.
+- macOS on Apple Silicon (tested on macOS 15, arm64) or Debian/Ubuntu Linux.
+  On macOS the CoreML EP is used; elsewhere it falls back to CPU.
+- Rust toolchain (stable, ≥ 1.85) — see https://rustup.rs.
+- A system package manager: `brew` on macOS, `apt` on Linux. `setup.sh`
+  installs everything else it needs (Python, `espeak-ng`).
 
-### 1. One-time: export the model
+### 1. One-time: download + export the model
+
+```sh
+./setup.sh
+```
+
+This downloads the Kokoro-82M checkpoint and voices from HuggingFace
+(`hexgrad/Kokoro-82M`, pinned to a known-good revision), installs the export
+dependencies into `export/.venv`, and converts everything into `assets/`. It is
+safe to re-run.
+
+<details>
+<summary>Manual export (if you already have Python set up)</summary>
 
 ```sh
 cd export
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python export.py
+python export.py                      # downloads from HuggingFace, then exports
+python export.py --snapshot /path/to/local/snapshot   # or use a local snapshot
 ```
+</details>
 
-This writes:
+Either path writes:
 
 ```
 assets/
@@ -537,7 +545,7 @@ actually sees.
 
 ## License
 
-This repository's code is available under the MIT license.
+This repository's code is available under the Apache 2.0 license.
 
 The Kokoro-82M model weights are distributed by hexgrad under Apache 2.0.
 `espeak-ng`, when used, is GPLv3; this tool invokes it as a separate process,

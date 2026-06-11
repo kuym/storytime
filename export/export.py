@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Export Kokoro-82M to ONNX + raw voice tensors + token vocab.
 
-Inputs are read from a local HuggingFace snapshot; no network calls.
-Outputs land in ../assets/ for the Rust CLI to consume.
+Inputs come from a HuggingFace snapshot: either a local directory passed via
+--snapshot, or (the default) downloaded from the Hub on demand. Outputs land in
+../assets/ for the Rust CLI to consume.
 
 Pipeline:
   kokoro-v1_0.pth  ->  kokoro.onnx
@@ -20,10 +21,33 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-DEFAULT_SNAPSHOT = Path(
-    "/Users/kuy/.cache/huggingface/hub/models--hexgrad--Kokoro-82M"
-    "/snapshots/f3ff3571791e39611d31c381e3a41a3af07b4987"
-)
+# Stable upstream source. The revision is pinned to a known-good commit so a
+# fresh setup is reproducible; pass --hf-revision main for the latest.
+HF_REPO = "hexgrad/Kokoro-82M"
+HF_REVISION = "f3ff3571791e39611d31c381e3a41a3af07b4987"
+
+
+def download_snapshot(repo: str, revision: str) -> Path:
+    """Fetch the weights, voices and config from the HuggingFace Hub.
+
+    Only the files we need are pulled, into the standard HF cache; the local
+    snapshot path is returned. Re-runs reuse the cache and work offline.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        sys.exit(
+            "huggingface_hub is required to download the model.\n"
+            "Run the repo's ./setup.sh, or: pip install huggingface_hub"
+        )
+    print(f"downloading {repo}@{revision[:12]} from HuggingFace ...", file=sys.stderr)
+    path = snapshot_download(
+        repo_id=repo,
+        revision=revision,
+        allow_patterns=["config.json", "kokoro-v1_0.pth", "voices/*.pt"],
+    )
+    print(f"  snapshot at {path}", file=sys.stderr)
+    return Path(path)
 
 
 class KokoroONNXWrapper(nn.Module):
@@ -116,7 +140,15 @@ def export_tokens(snapshot: Path, out_dir: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Export Kokoro-82M to ONNX assets")
-    ap.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT)
+    ap.add_argument(
+        "--snapshot", type=Path, default=None,
+        help="local HuggingFace snapshot dir; if omitted, download from the Hub",
+    )
+    ap.add_argument("--hf-repo", default=HF_REPO, help="HuggingFace repo to download")
+    ap.add_argument(
+        "--hf-revision", default=HF_REVISION,
+        help="pinned commit/branch (default is a known-good commit; use 'main' for latest)",
+    )
     ap.add_argument(
         "--out", type=Path,
         default=Path(__file__).resolve().parent.parent / "assets",
@@ -126,12 +158,19 @@ def main() -> None:
     ap.add_argument("--skip-voices", action="store_true")
     args = ap.parse_args()
 
+    if args.snapshot is None:
+        snapshot = download_snapshot(args.hf_repo, args.hf_revision)
+    elif args.snapshot.exists():
+        snapshot = args.snapshot
+    else:
+        sys.exit(f"snapshot not found: {args.snapshot}")
+
     args.out.mkdir(parents=True, exist_ok=True)
     if not args.skip_model:
-        export_model(args.snapshot, args.out, args.opset)
-    export_tokens(args.snapshot, args.out)
+        export_model(snapshot, args.out, args.opset)
+    export_tokens(snapshot, args.out)
     if not args.skip_voices:
-        export_voices(args.snapshot, args.out)
+        export_voices(snapshot, args.out)
     print("done.", file=sys.stderr)
 
 

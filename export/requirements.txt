@@ -4,3 +4,4 @@ onnx>=1.16
 kokoro>=0.9.2
 transformers==4.47.1
 onnxscript
+huggingface_hub>=0.23
