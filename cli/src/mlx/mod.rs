@@ -391,23 +391,36 @@ impl MlxRuntime {
 
             let outs = run_node(n, &mut env);
 
-            // Force this node's outputs to materialize. Without an eval the
-            // whole forward pass stays one lazy graph that pins every
-            // intermediate until the final read; evaluating per node collapses
-            // it so freed intermediates are actually released.
+            // Collect this node's output arrays, then force evaluation every
+            // EVAL_EVERY nodes. Evaluating collapses the lazy graph so freed
+            // intermediates are actually released (otherwise the whole forward
+            // pass stays one graph that pins everything until the final read);
+            // batching a handful of nodes per eval cuts GPU sync round-trips so
+            // the GPU isn't stalled one op at a time. We only ever evaluate
+            // freshly-produced outputs (never a handle a later sweep may free),
+            // so this is safe regardless of cadence.
+            const EVAL_EVERY: usize = 8;
             let mut out_ctx: HashSet<usize> = HashSet::new();
+            let mut out_arrays: Vec<mlx_array> = Vec::new();
             for (_, v) in &outs {
                 match v {
                     Val::A(a) => {
                         out_ctx.insert(ctxof(*a));
-                        unsafe { mlx_array_eval(*a) };
+                        out_arrays.push(*a);
                     }
                     Val::Seq(s) => {
                         for a in s {
                             out_ctx.insert(ctxof(*a));
-                            unsafe { mlx_array_eval(*a) };
+                            out_arrays.push(*a);
                         }
                     }
+                }
+            }
+            if i % EVAL_EVERY == 0 && !out_arrays.is_empty() {
+                unsafe {
+                    let vec = mlx_vector_array_new_data(out_arrays.as_ptr(), out_arrays.len());
+                    mlx_eval(vec);
+                    mlx_vector_array_free(vec);
                 }
             }
 

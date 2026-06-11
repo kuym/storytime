@@ -720,38 +720,48 @@ fn lstm(env: &Env, n: &Node) -> Vec<(String, Val)> {
     let ndir = if dir == "bidirectional" { 2 } else { 1 };
     let g4 = 4 * hidden;
 
-    let xd = read_f32(x);
-    let wd = read_f32(w);
     let rd = read_f32(r);
-    let bd = b.map(read_f32);
+
+    // The input projection X·Wᵀ (+ Wb + Rb) is not recurrent, so compute it for
+    // every timestep at once as a GPU matmul instead of a scalar host loop — it
+    // is ~inn/(inn+hidden) of the LSTM's MACs and was the dominant CPU cost.
+    // Only the h·Rᵀ recurrence below stays sequential on the host.
+    let x2 = reshape(x, &[seq * batch, inn]); // [seq*batch, in]
+    let mut xw: Vec<Vec<f32>> = Vec::with_capacity(ndir as usize);
+    for d in 0..ndir {
+        let wd = reshape(slice_axis(w, 0, d as i64, (d + 1) as i64), &[g4, inn]);
+        let wt = transpose(wd, &[1, 0]); // [in, 4h]
+        let mut proj = op!(mlx_matmul, x2, wt); // [seq*batch, 4h]
+        if let Some(bb) = b {
+            // bias = Wb + Rb for this direction (ONNX B = [Wb; Rb], each 4h).
+            let brow = reshape(slice_axis(bb, 0, d as i64, (d + 1) as i64), &[8 * hidden]);
+            let wb = slice_axis(brow, 0, 0, g4 as i64);
+            let rb = slice_axis(brow, 0, g4 as i64, (8 * hidden) as i64);
+            let bias = reshape(op!(mlx_add, wb, rb), &[1, g4]);
+            proj = op!(mlx_add, proj, bias);
+        }
+        xw.push(read_f32(proj)); // [seq*batch, 4h], row = t*batch+bt
+    }
 
     let mut y = vec![0f32; (seq * ndir * batch * hidden) as usize];
     let mut yh = vec![0f32; (ndir * batch * hidden) as usize];
     let mut yc = vec![0f32; (ndir * batch * hidden) as usize];
 
     for d in 0..ndir {
-        let woff = (d * g4 * inn) as usize;
         let roff = (d * g4 * hidden) as usize;
-        let wb = bd.as_ref().map(|_| (d * 8 * hidden) as usize);
+        let xwd = &xw[d as usize];
         for bt in 0..batch {
             let mut h = vec![0f32; hidden as usize];
             let mut c = vec![0f32; hidden as usize];
             for k in 0..seq {
                 let t = if d == 0 { k } else { seq - 1 - k };
+                let grow = ((t * batch + bt) * g4) as usize;
                 let mut gate = vec![0f32; g4 as usize];
                 for gi in 0..g4 {
-                    let mut acc = 0f32;
-                    let wr = woff + (gi * inn) as usize;
-                    for ii in 0..inn {
-                        acc += xd[((t * batch + bt) * inn + ii) as usize] * wd[wr + ii as usize];
-                    }
+                    let mut acc = xwd[grow + gi as usize];
                     let rr = roff + (gi * hidden) as usize;
                     for hh in 0..hidden {
                         acc += h[hh as usize] * rd[rr + hh as usize];
-                    }
-                    if let Some(o) = wb {
-                        acc += bd.as_ref().unwrap()[o + gi as usize]
-                            + bd.as_ref().unwrap()[o + (g4 + gi) as usize];
                     }
                     gate[gi as usize] = acc;
                 }
