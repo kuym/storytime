@@ -95,7 +95,10 @@ fn contig(a: mlx_array) -> mlx_array {
         mlx_contiguous(&mut r, a, false, st());
         mlx_array_eval(r);
     }
-    r
+    track(r)
+}
+fn ctxof(a: mlx_array) -> usize {
+    a.ctx as usize
 }
 fn read_f32(a: mlx_array) -> Vec<f32> {
     let a = if dtype(a) == F32 { a } else { op!(mlx_astype, a, F32) };
@@ -217,6 +220,52 @@ enum Val {
 }
 type Env = HashMap<String, Val>;
 
+// ---- liveness (for per-chunk garbage collection) ----
+
+// Every value name referenced anywhere inside a control-flow subgraph (at any
+// nesting depth). Used so a value captured only by an If/Loop body is kept
+// alive until the controlling node has run.
+fn collect_subgraph_refs(sg: &Subgraph, set: &mut std::collections::HashSet<String>) {
+    for n in &sg.nodes {
+        for inp in &n.input {
+            if !inp.is_empty() {
+                set.insert(inp.clone());
+            }
+        }
+        for a in n.attr.values() {
+            if let Attr::G(inner) = a {
+                collect_subgraph_refs(inner, set);
+            }
+        }
+    }
+}
+
+// last_use[name] = index of the last top-level node that reads `name` (either
+// directly or, for If/Loop nodes, anywhere in a nested subgraph). A value whose
+// last use is node i can be freed once node i has executed. Names produced but
+// never consumed (e.g. the graph output "audio") get no entry and are kept
+// until the chunk-end sweep.
+fn compute_last_use(nodes: &[Node]) -> HashMap<String, usize> {
+    let mut lu = HashMap::new();
+    for (i, n) in nodes.iter().enumerate() {
+        for inp in &n.input {
+            if !inp.is_empty() {
+                lu.insert(inp.clone(), i);
+            }
+        }
+        for a in n.attr.values() {
+            if let Attr::G(sg) = a {
+                let mut refs = std::collections::HashSet::new();
+                collect_subgraph_refs(sg, &mut refs);
+                for r in refs {
+                    lu.insert(r, i);
+                }
+            }
+        }
+    }
+    lu
+}
+
 fn ga(env: &Env, name: &str) -> mlx_array {
     match env.get(name) {
         Some(Val::A(a)) => *a,
@@ -254,6 +303,11 @@ pub fn gpu_available() -> bool {
 
 pub struct MlxRuntime {
     graph: Graph,
+    // Index of the last top-level node that reads each value (see compute_last_use).
+    last_use: HashMap<String, usize>,
+    // ctx pointers of the persistent weight arrays — these are never freed by
+    // the per-chunk garbage collector.
+    weight_ctx: HashSet<usize>,
 }
 
 impl MlxRuntime {
@@ -269,37 +323,41 @@ impl MlxRuntime {
             STREAM = match device {
                 Device::Gpu => mlx_default_gpu_stream_new(),
                 Device::Cpu => mlx_default_cpu_stream_new(),
-            }
+            };
+            // Cap MLX's reuse cache so freed buffers are returned to the OS
+            // within a chunk instead of accumulating to the chunk's high-water
+            // mark. The live working set is well under this, so reuse stays hot.
+            let mut prev = 0usize;
+            mlx_set_cache_limit(&mut prev, 512 * 1024 * 1024);
         };
-        Ok(Self { graph })
+        let last_use = compute_last_use(&graph.nodes);
+        let weight_ctx: HashSet<usize> = graph.weights.values().map(|a| ctxof(*a)).collect();
+        Ok(Self {
+            graph,
+            last_use,
+            weight_ctx,
+        })
     }
 
     /// Synthesize one chunk. `tokens` are phoneme token ids (no padding),
     /// `style` is the 256-dim voice row, `speed` the rate multiplier.
     pub fn synthesize(&self, tokens: &[i64], style: &[f32], speed: f32) -> Result<Vec<f32>> {
-        // Activate per-call arenas so every array created while interpreting
-        // this chunk is freed at the end (weights, created at load, are not
-        // registered and persist). Without this the interpreter leaks all
-        // intermediates and OOMs on multi-chunk inputs.
+        // Activate the per-node temporary arena (track/track_vec register here).
+        // synthesize_inner clears it after every node, freeing that node's
+        // intermediates, and frees long-lived values via liveness analysis — so
+        // only the live working set is resident, not the whole forward pass.
         unsafe {
             ARENA = Some(Vec::new());
             VARENA = Some(Vec::new());
         }
         let result = self.synthesize_inner(tokens, style, speed);
         unsafe {
-            if let Some(arr) = ARENA.take() {
-                let mut seen: HashSet<usize> = HashSet::with_capacity(arr.len());
-                for a in arr {
-                    if seen.insert(a.ctx as usize) {
-                        mlx_array_free(a);
-                    }
-                }
-            }
-            if let Some(varr) = VARENA.take() {
-                for v in varr {
-                    mlx_vector_array_free(v);
-                }
-            }
+            ARENA = None;
+            VARENA = None;
+            // Return cached (idle) buffers to the OS between chunks so peak
+            // footprint reflects one chunk's working set, not the high-water
+            // mark of every chunk seen so far.
+            mlx_clear_cache();
         }
         result
     }
@@ -321,17 +379,170 @@ impl MlxRuntime {
         env.insert("style".into(), Val::A(style_a));
         env.insert("speed".into(), Val::A(speed_a));
 
-        for n in &self.graph.nodes {
+        let wctx = &self.weight_ctx;
+        for (i, n) in self.graph.nodes.iter().enumerate() {
+            // Start a fresh temp arena for this node. (Anything created before
+            // the loop, e.g. input_ids, is untracked here but lives in env and
+            // is reclaimed by the liveness sweep below.)
+            unsafe {
+                ARENA.as_mut().unwrap().clear();
+                VARENA.as_mut().unwrap().clear();
+            }
+
             let outs = run_node(n, &mut env);
+
+            // Force this node's outputs to materialize. Without an eval the
+            // whole forward pass stays one lazy graph that pins every
+            // intermediate until the final read; evaluating per node collapses
+            // it so freed intermediates are actually released.
+            let mut out_ctx: HashSet<usize> = HashSet::new();
+            for (_, v) in &outs {
+                match v {
+                    Val::A(a) => {
+                        out_ctx.insert(ctxof(*a));
+                        unsafe { mlx_array_eval(*a) };
+                    }
+                    Val::Seq(s) => {
+                        for a in s {
+                            out_ctx.insert(ctxof(*a));
+                            unsafe { mlx_array_eval(*a) };
+                        }
+                    }
+                }
+            }
+
+            // Free this node's internal temporaries: everything created while
+            // running it except the arrays it returns (and weights, which can
+            // flow through unchanged via e.g. Identity).
+            unsafe {
+                let arr = ARENA.as_mut().unwrap();
+                let mut seen: HashSet<usize> = HashSet::with_capacity(arr.len());
+                for &a in arr.iter() {
+                    let c = ctxof(a);
+                    if out_ctx.contains(&c) || wctx.contains(&c) {
+                        continue;
+                    }
+                    if seen.insert(c) {
+                        mlx_array_free(a);
+                    }
+                }
+                arr.clear();
+                let varr = VARENA.as_mut().unwrap();
+                for &v in varr.iter() {
+                    mlx_vector_array_free(v);
+                }
+                varr.clear();
+            }
+
             for (k, v) in outs {
                 env.insert(k, v);
             }
+
+            // Liveness sweep: free any env value whose last use was this node.
+            // Candidates are exactly the names this node read (directly or via a
+            // subgraph) — only those can have last_use == i.
+            let mut dead_names: Vec<String> = Vec::new();
+            for inp in &n.input {
+                if self.last_use.get(inp) == Some(&i) {
+                    dead_names.push(inp.clone());
+                }
+            }
+            for a in n.attr.values() {
+                if let Attr::G(sg) = a {
+                    let mut refs = HashSet::new();
+                    collect_subgraph_refs(sg, &mut refs);
+                    for r in refs {
+                        if self.last_use.get(&r) == Some(&i) {
+                            dead_names.push(r);
+                        }
+                    }
+                }
+            }
+            let mut dead: Vec<mlx_array> = Vec::new();
+            for name in &dead_names {
+                if let Some(v) = env.remove(name) {
+                    match v {
+                        Val::A(a) => dead.push(a),
+                        Val::Seq(s) => dead.extend(s),
+                    }
+                }
+            }
+            free_dead(&dead, &env, wctx);
         }
-        match env.get("audio") {
-            // read_f32 copies to a host Vec, so the audio array can be freed
-            // with the rest of the arena after this returns.
-            Some(Val::A(a)) => Ok(read_f32(*a)),
+
+        let audio = match env.get("audio") {
+            Some(Val::A(a)) => *a,
             _ => bail!("MLX interpreter produced no audio output"),
+        };
+        let out = read_f32(audio); // copies to a host Vec
+
+        // Final cleanup: free the read temporaries and every remaining non-weight
+        // value (the audio buffer and any produced-but-unconsumed outputs).
+        unsafe {
+            let mut seen: HashSet<usize> = HashSet::new();
+            for &a in ARENA.as_mut().unwrap().iter() {
+                let c = ctxof(a);
+                if !wctx.contains(&c) && seen.insert(c) {
+                    mlx_array_free(a);
+                }
+            }
+            ARENA.as_mut().unwrap().clear();
+            for &v in VARENA.as_mut().unwrap().iter() {
+                mlx_vector_array_free(v);
+            }
+            VARENA.as_mut().unwrap().clear();
+            for v in env.values() {
+                match v {
+                    Val::A(a) => {
+                        let c = ctxof(*a);
+                        if !wctx.contains(&c) && seen.insert(c) {
+                            mlx_array_free(*a);
+                        }
+                    }
+                    Val::Seq(s) => {
+                        for a in s {
+                            let c = ctxof(*a);
+                            if !wctx.contains(&c) && seen.insert(c) {
+                                mlx_array_free(*a);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+// Free arrays in `dead` that are not weights and are not still referenced by any
+// remaining value in `env`. Deduped by ctx so aliased handles (e.g. an Identity
+// output sharing a ctx with its input) are freed at most once and never while a
+// live name still points at them.
+fn free_dead(dead: &[mlx_array], env: &Env, wctx: &HashSet<usize>) {
+    if dead.is_empty() {
+        return;
+    }
+    let mut live: HashSet<usize> = HashSet::new();
+    for v in env.values() {
+        match v {
+            Val::A(a) => {
+                live.insert(ctxof(*a));
+            }
+            Val::Seq(s) => {
+                for a in s {
+                    live.insert(ctxof(*a));
+                }
+            }
+        }
+    }
+    let mut freed: HashSet<usize> = HashSet::new();
+    for &a in dead {
+        let c = ctxof(a);
+        if wctx.contains(&c) || live.contains(&c) {
+            continue;
+        }
+        if freed.insert(c) {
+            unsafe { mlx_array_free(a) };
         }
     }
 }
