@@ -12,6 +12,9 @@ assets/
 # Generated audio
 *.wav
 
+# Local demo/benchmark stories (scratch input, not source)
+demo/
+
 # macOS
 .DS_Store
 
