@@ -2,13 +2,19 @@
 //! via the mlx-c API. Parses the ONNX graph natively (no derived artifacts),
 //! folds constants, and runs each node as an mlx-c op. Verified numerically
 //! equivalent to ONNX Runtime CPU (see docs/onnx-to-mlx-plan.md).
-#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
+#![allow(
+    non_upper_case_globals,
+    non_camel_case_types,
+    non_snake_case,
+    dead_code,
+    static_mut_refs
+)]
 
 mod sys {
     include!(concat!(env!("OUT_DIR"), "/mlx_bindings.rs"));
 }
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use sys::*;
 
@@ -32,7 +38,32 @@ fn newarr() -> mlx_array {
 fn rng_key(seed: u64) -> mlx_array {
     let mut r = newarr();
     unsafe { mlx_random_key(&mut r, seed) };
-    r
+    track(r)
+}
+
+// Per-synthesize arenas: every array/vector created while interpreting a chunk
+// is registered here and freed when the chunk completes. mlx_array is a Copy
+// pointer struct with no Drop, so without this the interpreter leaks every
+// intermediate. Weights are created at load time (arena inactive) so they are
+// never registered and persist across chunks.
+static mut ARENA: Option<Vec<mlx_array>> = None;
+static mut VARENA: Option<Vec<mlx_vector_array>> = None;
+
+fn track(a: mlx_array) -> mlx_array {
+    unsafe {
+        if let Some(ar) = ARENA.as_mut() {
+            ar.push(a);
+        }
+    }
+    a
+}
+fn track_vec(v: mlx_vector_array) -> mlx_vector_array {
+    unsafe {
+        if let Some(ar) = VARENA.as_mut() {
+            ar.push(v);
+        }
+    }
+    v
 }
 
 /// Generic op call: `$f(&mut res, args.., stream)` -> res.
@@ -41,7 +72,7 @@ macro_rules! op {
         let mut r = newarr();
         let rc = unsafe { $f(&mut r as *mut _, $($a,)* st()) };
         assert_eq!(rc, 0, concat!("rc!=0 in ", stringify!($f)));
-        r
+        track(r)
     }};
 }
 
@@ -85,20 +116,20 @@ fn read_i64(a: mlx_array) -> Vec<i64> {
     }
 }
 fn from_f32(data: &[f32], shp: &[i32]) -> mlx_array {
-    unsafe { mlx_array_new_data(data.as_ptr() as *const _, shp.as_ptr(), shp.len() as i32, F32) }
+    track(unsafe { mlx_array_new_data(data.as_ptr() as *const _, shp.as_ptr(), shp.len() as i32, F32) })
 }
 fn from_i64(data: &[i64], shp: &[i32]) -> mlx_array {
-    unsafe { mlx_array_new_data(data.as_ptr() as *const _, shp.as_ptr(), shp.len() as i32, INT64) }
+    track(unsafe { mlx_array_new_data(data.as_ptr() as *const _, shp.as_ptr(), shp.len() as i32, INT64) })
 }
 fn from_i32(data: &[i32], shp: &[i32]) -> mlx_array {
-    unsafe { mlx_array_new_data(data.as_ptr() as *const _, shp.as_ptr(), shp.len() as i32, INT32) }
+    track(unsafe { mlx_array_new_data(data.as_ptr() as *const _, shp.as_ptr(), shp.len() as i32, INT32) })
 }
 fn scalar_f32(v: f32) -> mlx_array {
-    unsafe { mlx_array_new_data(&v as *const _ as *const _, std::ptr::null(), 0, F32) }
+    track(unsafe { mlx_array_new_data(&v as *const _ as *const _, std::ptr::null(), 0, F32) })
 }
 fn bool_scalar(b: bool) -> mlx_array {
     let v: u8 = b as u8;
-    unsafe { mlx_array_new_data(&v as *const u8 as *const _, std::ptr::null(), 0, BOOL) }
+    track(unsafe { mlx_array_new_data(&v as *const u8 as *const _, std::ptr::null(), 0, BOOL) })
 }
 fn transpose(a: mlx_array, perm: &[i32]) -> mlx_array {
     op!(mlx_transpose_axes, a, perm.as_ptr(), perm.len())
@@ -246,6 +277,34 @@ impl MlxRuntime {
     /// Synthesize one chunk. `tokens` are phoneme token ids (no padding),
     /// `style` is the 256-dim voice row, `speed` the rate multiplier.
     pub fn synthesize(&self, tokens: &[i64], style: &[f32], speed: f32) -> Result<Vec<f32>> {
+        // Activate per-call arenas so every array created while interpreting
+        // this chunk is freed at the end (weights, created at load, are not
+        // registered and persist). Without this the interpreter leaks all
+        // intermediates and OOMs on multi-chunk inputs.
+        unsafe {
+            ARENA = Some(Vec::new());
+            VARENA = Some(Vec::new());
+        }
+        let result = self.synthesize_inner(tokens, style, speed);
+        unsafe {
+            if let Some(arr) = ARENA.take() {
+                let mut seen: HashSet<usize> = HashSet::with_capacity(arr.len());
+                for a in arr {
+                    if seen.insert(a.ctx as usize) {
+                        mlx_array_free(a);
+                    }
+                }
+            }
+            if let Some(varr) = VARENA.take() {
+                for v in varr {
+                    mlx_vector_array_free(v);
+                }
+            }
+        }
+        result
+    }
+
+    fn synthesize_inner(&self, tokens: &[i64], style: &[f32], speed: f32) -> Result<Vec<f32>> {
         let mut ids = Vec::with_capacity(tokens.len() + 2);
         ids.push(0);
         ids.extend_from_slice(tokens);
@@ -269,6 +328,8 @@ impl MlxRuntime {
             }
         }
         match env.get("audio") {
+            // read_f32 copies to a host Vec, so the audio array can be freed
+            // with the rest of the arena after this returns.
             Some(Val::A(a)) => Ok(read_f32(*a)),
             _ => bail!("MLX interpreter produced no audio output"),
         }

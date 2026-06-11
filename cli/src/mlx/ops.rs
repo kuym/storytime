@@ -144,7 +144,7 @@ fn run_node(n: &Node, env: &mut Env) -> Vec<(String, Val)> {
         "Concat" => {
             let axis = n.ai("axis", 0) as i32;
             let arrs: Vec<mlx_array> = n.input.iter().map(|i| ga(env, i)).collect();
-            let vec = unsafe { mlx_vector_array_new_data(arrs.as_ptr(), arrs.len()) };
+            let vec = track_vec(unsafe { mlx_vector_array_new_data(arrs.as_ptr(), arrs.len()) });
             one(op!(mlx_concatenate_axis, vec, axis))
         }
         "Unsqueeze" => {
@@ -319,7 +319,7 @@ fn run_node(n: &Node, env: &mut Env) -> Vec<(String, Val)> {
             let seq = gseq(env, &n.input[0]);
             let axis = n.ai("axis", 0) as i32;
             let new_axis = n.ai("new_axis", 0);
-            let v = unsafe { mlx_vector_array_new_data(seq.as_ptr(), seq.len()) };
+            let v = track_vec(unsafe { mlx_vector_array_new_data(seq.as_ptr(), seq.len()) });
             if new_axis != 0 {
                 one(op!(mlx_stack_axis, v, axis))
             } else {
@@ -700,7 +700,7 @@ fn layer_norm(env: &Env, n: &Node) -> Vec<(String, Val)> {
     unsafe {
         mlx_fast_layer_norm(&mut r0, x, scale, bias, eps, st());
     }
-    vec![(n.output[0].clone(), Val::A(r0))]
+    vec![(n.output[0].clone(), Val::A(track(r0)))]
 }
 
 // ONNX LSTM (forward or bidirectional), gate order iofc.
