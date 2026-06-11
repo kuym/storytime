@@ -247,6 +247,13 @@ implementations, not a bug** — it cannot be removed without bit-matching ONNX'
 exact summation/rounding through the oscillator. Perceptually 1.9e-2 (≈ −34 dB)
 is indistinguishable.
 
+**Proof of isolation:** with the oscillator (`m_source`) outputs injected from
+the reference (`INJECT=m_source`), the final audio matches ONNX Runtime CPU to
+**rel 7.2e-6** with **zero** diverging intermediates. So every one of the 56 ops
+and the entire rest of the vocoder (STFT, `atan2` phase, upsampling, noise convs,
+iSTFT) is numerically exact to float32 epsilon; the 1.9e-2 is *entirely* the
+oscillator's conditioning.
+
 **Bugs found and fixed along the way (each caught by node-level parity):**
 - `np.ascontiguousarray` forces ndim≥1 → silently turned rank-0 scalar constants
   (Gather indices) into `(1,)`, corrupting ONNX rank propagation. Fixed in lower.py.

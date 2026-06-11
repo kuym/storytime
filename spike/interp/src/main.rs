@@ -266,6 +266,7 @@ fn main() {
     let mut worst = 0f64;
     let mut diverged = 0u32;
     let verbose = std::env::var("V").is_ok();
+    let inject = std::env::var("INJECT").ok();
     for (ni, n) in g.nodes.iter().enumerate() {
         if verbose {
             let ins: Vec<Vec<i32>> = n
@@ -281,6 +282,16 @@ fn main() {
         }
         let outs = run_node(n, &mut env, &refmap);
         for (name, a) in outs {
+            // Diagnostic: override matching float outputs with the ref value to
+            // isolate where the audio error originates (INJECT=<substr>).
+            let a = match (&inject, &a) {
+                (Some(sub), Val::A(arr))
+                    if dtype(*arr) == F32 && name.contains(sub.as_str()) && refmap.contains_key(&name) =>
+                {
+                    Val::A(refmap[&name])
+                }
+                _ => a,
+            };
             env.insert(name.clone(), a.clone());
             if let Val::A(arr) = a {
                 if let Some(r) = refmap.get(&name) {
