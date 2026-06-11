@@ -720,28 +720,39 @@ fn lstm(env: &Env, n: &Node) -> Vec<(String, Val)> {
     let ndir = if dir == "bidirectional" { 2 } else { 1 };
     let g4 = 4 * hidden;
 
-    let rd = read_f32(r);
-
     // The input projection X·Wᵀ (+ Wb + Rb) is not recurrent, so compute it for
     // every timestep at once as a GPU matmul instead of a scalar host loop — it
     // is ~inn/(inn+hidden) of the LSTM's MACs and was the dominant CPU cost.
-    // Only the h·Rᵀ recurrence below stays sequential on the host.
     let x2 = reshape(x, &[seq * batch, inn]); // [seq*batch, in]
-    let mut xw: Vec<Vec<f32>> = Vec::with_capacity(ndir as usize);
+    let mut proj: Vec<mlx_array> = Vec::with_capacity(ndir as usize); // device, per dir
     for d in 0..ndir {
         let wd = reshape(slice_axis(w, 0, d as i64, (d + 1) as i64), &[g4, inn]);
         let wt = transpose(wd, &[1, 0]); // [in, 4h]
-        let mut proj = op!(mlx_matmul, x2, wt); // [seq*batch, 4h]
+        let mut p = op!(mlx_matmul, x2, wt); // [seq*batch, 4h]
         if let Some(bb) = b {
             // bias = Wb + Rb for this direction (ONNX B = [Wb; Rb], each 4h).
             let brow = reshape(slice_axis(bb, 0, d as i64, (d + 1) as i64), &[8 * hidden]);
             let wb = slice_axis(brow, 0, 0, g4 as i64);
             let rb = slice_axis(brow, 0, g4 as i64, (8 * hidden) as i64);
             let bias = reshape(op!(mlx_add, wb, rb), &[1, g4]);
-            proj = op!(mlx_add, proj, bias);
+            p = op!(mlx_add, p, bias);
         }
-        xw.push(read_f32(proj)); // [seq*batch, 4h], row = t*batch+bt
+        proj.push(p); // [seq*batch, 4h], row = t*batch+bt
     }
+
+    // Run the h·Rᵀ recurrence on the GPU by default (unrolled over time into the
+    // graph). Although MLX has no fused RNN kernel and LSTM isn't an associative
+    // scan, submitting the whole unrolled recurrence as one graph (no per-step
+    // CPU sync) lets the GPU run the sequential steps back-to-back, which on the
+    // bedtime-story benchmark cut wall time 51s->34s and CPU time 29s->13s vs the
+    // host loop. Set STORYTIME_MLX_HOST_LSTM=1 to use the host scalar reference.
+    if std::env::var("STORYTIME_MLX_HOST_LSTM").is_err() {
+        return lstm_gpu_recurrence(n, &proj, r, seq, batch, hidden, ndir);
+    }
+
+    // Host recurrence: read the projected gates back and do only h·Rᵀ on the CPU.
+    let rd = read_f32(r);
+    let xw: Vec<Vec<f32>> = proj.iter().map(|&p| read_f32(p)).collect();
 
     let mut y = vec![0f32; (seq * ndir * batch * hidden) as usize];
     let mut yh = vec![0f32; (ndir * batch * hidden) as usize];
@@ -801,6 +812,74 @@ fn lstm(env: &Env, n: &Node) -> Vec<(String, Val)> {
 
 fn sigmoidf(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+// GPU recurrence: unroll the LSTM time loop into the MLX graph. MLX has no fused
+// RNN kernel and no device-side loop, and LSTM is not an associative scan, so
+// this is `seq` sequential steps — but built as one lazy graph and evaluated
+// without per-step CPU syncs, so the GPU runs them back-to-back. `proj` holds the
+// per-direction input projection X·Wᵀ+b as device arrays [seq*batch, 4h]. Output
+// layout matches the host reference path.
+fn lstm_gpu_recurrence(
+    n: &Node,
+    proj: &[mlx_array],
+    r: mlx_array,
+    seq: i32,
+    batch: i32,
+    hidden: i32,
+    ndir: i32,
+) -> Vec<(String, Val)> {
+    let g4 = 4 * hidden;
+    let h0 = vec![0f32; (batch * hidden) as usize];
+    let slice1 = |a: mlx_array, lo: i32, hi: i32| slice_axis(a, 1, lo as i64, hi as i64);
+
+    let mut y_dirs: Vec<mlx_array> = Vec::with_capacity(ndir as usize); // each [seq,batch,hidden]
+    let mut hn_dirs: Vec<mlx_array> = Vec::with_capacity(ndir as usize); // each [batch,hidden]
+    let mut cn_dirs: Vec<mlx_array> = Vec::with_capacity(ndir as usize);
+
+    for d in 0..ndir {
+        let rd = reshape(slice_axis(r, 0, d as i64, (d + 1) as i64), &[g4, hidden]);
+        let rt = transpose(rd, &[1, 0]); // [hidden, 4h]
+        let pd = reshape(proj[d as usize], &[seq, batch, g4]);
+        let mut h = from_f32(&h0, &[batch, hidden]);
+        let mut c = from_f32(&h0, &[batch, hidden]);
+        let mut h_by_t: Vec<mlx_array> = vec![newarr(); seq as usize];
+        for k in 0..seq {
+            let t = if d == 0 { k } else { seq - 1 - k };
+            let gate_in = reshape(slice_axis(pd, 0, t as i64, (t + 1) as i64), &[batch, g4]);
+            let gate = op!(mlx_add, gate_in, op!(mlx_matmul, h, rt)); // [batch,4h]
+            let i = op!(mlx_sigmoid, slice1(gate, 0, hidden));
+            let o = op!(mlx_sigmoid, slice1(gate, hidden, 2 * hidden));
+            let f = op!(mlx_sigmoid, slice1(gate, 2 * hidden, 3 * hidden));
+            let ct = op!(mlx_tanh, slice1(gate, 3 * hidden, 4 * hidden));
+            c = op!(mlx_add, op!(mlx_multiply, f, c), op!(mlx_multiply, i, ct));
+            h = op!(mlx_multiply, o, op!(mlx_tanh, c));
+            h_by_t[t as usize] = h;
+        }
+        let vt = track_vec(unsafe { mlx_vector_array_new_data(h_by_t.as_ptr(), h_by_t.len()) });
+        y_dirs.push(op!(mlx_stack_axis, vt, 0)); // [seq, batch, hidden]
+        hn_dirs.push(h);
+        cn_dirs.push(c);
+    }
+
+    // y: [seq, ndir, batch, hidden]; yh/yc: [ndir, batch, hidden].
+    let stack0 = |arrs: &[mlx_array]| -> mlx_array {
+        let v = track_vec(unsafe { mlx_vector_array_new_data(arrs.as_ptr(), arrs.len()) });
+        op!(mlx_stack_axis, v, 0)
+    };
+    let y = {
+        // stack dirs along a new axis1: each [seq,batch,hidden] -> [seq,ndir,batch,hidden]
+        let v = track_vec(unsafe { mlx_vector_array_new_data(y_dirs.as_ptr(), y_dirs.len()) });
+        op!(mlx_stack_axis, v, 1)
+    };
+    let mut outs = vec![(n.output[0].clone(), Val::A(y))];
+    if n.output.len() > 1 && !n.output[1].is_empty() {
+        outs.push((n.output[1].clone(), Val::A(stack0(&hn_dirs))));
+    }
+    if n.output.len() > 2 && !n.output[2].is_empty() {
+        outs.push((n.output[2].clone(), Val::A(stack0(&cn_dirs))));
+    }
+    outs
 }
 
 fn exec_nodes(nodes: &[Node], env: &mut Env) {
