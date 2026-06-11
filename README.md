@@ -50,35 +50,41 @@ plain float32 voice tensors that the Rust CLI consumes.
 
 ## Inference backends
 
-`storytime` supports two backends, selectable via `--backend`:
+`storytime` supports two backends, selectable via `--backend`. **Both use the
+same `kokoro.onnx` model and `voices/*.bin` assets** — there is no separate set
+of MLX weights.
 
-| backend | flag | acceleration | weights format | notes |
-|---|---|---|---|---|
-| **ONNX** (default) | `--backend onnx` | CoreML EP (ANE/GPU/CPU) | `kokoro.onnx` (exported via `export.py`) | Stable, tested |
-| **MLX** | `--backend mlx` | Metal GPU (Apple Silicon) | safetensors (from [mlx-community/Kokoro-82M-bf16](https://huggingface.co/mlx-community/Kokoro-82M-bf16)) | Requires `--features mlx` at build time |
+| backend | flag | acceleration | notes |
+|---|---|---|---|
+| **ONNX** | `--backend onnx` | CoreML EP (ANE/GPU/CPU) | available in every build |
+| **MLX** | `--backend mlx` | Metal GPU, else CPU | requires `--features mlx`; **the default in that case** |
 
-### MLX backend setup
+### MLX backend
+
+The MLX backend interprets `kokoro.onnx` **directly** on Apple's
+[MLX](https://github.com/ml-explore/mlx) (via the [mlx-c](https://github.com/ml-explore/mlx-c)
+C API): it parses the ONNX graph natively in Rust and runs each operator as an
+MLX op on the Metal GPU. It is verified numerically equivalent to ONNX Runtime
+CPU, op-for-op, to float32 epsilon (the only residual is the inherent f32
+conditioning of the vocoder's harmonic oscillator — see
+`docs/onnx-to-mlx-plan.md`).
 
 ```sh
-# 1. Build with MLX support (requires Xcode + macOS 14+)
+# Build with MLX support (requires Xcode + the Metal toolchain + macOS 14+).
+# First build clones and compiles mlx-c (~5 min); cached afterwards.
 cd cli
-MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release --features mlx
+cargo build --release --features mlx
+# (if Metal compilation fails: xcodebuild -downloadComponent MetalToolchain)
 
-# 2. Download MLX-format weights
-# Place config.json + *.safetensors + voices/*.safetensors in assets/mlx/
-# or pass --mlx-weights /path/to/weights
-
-# 3. Run
-echo "Hello." | storytime --backend mlx --mlx-weights /path/to/Kokoro-82M-bf16
+# Run — MLX is the default backend in an mlx build; GPU is auto-selected.
+echo "Hello." | storytime -o hello.wav            # backend=mlx, device=Gpu
+echo "Hello." | storytime --backend onnx -o h.wav # force the ONNX backend
 ```
 
-The MLX backend uses Apple's [MLX framework](https://github.com/ml-explore/mlx)
-(vendored as a git submodule at `vendor/mlx-swift`) for Metal GPU-accelerated
-inference. The Kokoro model architecture is ported to Swift using mlx-swift's
-`MLXNN` module, and exposed to Rust via `@_cdecl` C-callable bridge functions.
-
-Without `--features mlx`, `--backend mlx` prints an error and the binary
-has no MLX dependency at all.
+With `--features mlx`, the default backend is **MLX on the Metal GPU** when a
+compatible GPU is present, falling back to **MLX on CPU** otherwise. Without the
+feature, only the ONNX backend is compiled in and is the default. The MLX build
+vendors nothing — `build.rs` fetches and builds mlx-c at build time.
 
 ## Architecture
 
@@ -486,7 +492,11 @@ storytime/
 │   └── requirements.txt
 ├── cli/                     # Rust CLI (runtime)
 │   ├── Cargo.toml
-│   └── src/main.rs
+│   ├── build.rs             # fetches+builds mlx-c under --features mlx
+│   └── src/
+│       ├── main.rs
+│       └── mlx/             # MLX backend: native ONNX-graph interpreter
+├── docs/                    # ONNX->MLX design + verification notes
 ├── assets/                  # produced by export.py (gitignored)
 │   ├── kokoro.onnx
 │   ├── tokens.json

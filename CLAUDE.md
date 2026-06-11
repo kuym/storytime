@@ -22,8 +22,8 @@ cargo test                       # unit tests live at the bottom of src/main.rs
 cargo test parse_emphasis        # run a single test by name substring
 cargo clippy
 
-# MLX backend (optional, Apple Silicon + Xcode + macOS 14+):
-MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release --features mlx
+# MLX backend (optional, Apple Silicon + Xcode + Metal toolchain + macOS 14+):
+cargo build --release --features mlx   # build.rs fetches+builds mlx-c (~5 min, cached)
 ```
 
 One-time model export (regenerates the gitignored `assets/`):
@@ -68,8 +68,9 @@ because each stage assumes the previous one's invariants:
    primary-stressed vowel with `ː`). Sentinels never reach espeak or the model.
 5. **`chunk_ipa`** — the model's style tensor caps at ~510 tokens. Long IPA is split at sentence
    (`.!?;…`) → word → char boundaries (`split_long_sentence`/`hard_split`) so no chunk exceeds the cap.
-6. **`tokenize`** → **synthesis** (`synthesize_chunk` for ONNX, `synthesize_mlx` for MLX) → per-chunk
-   `trim_silence` + `apply_fade` + typed silence gap → concat → `resample` → `write_wav`/playback.
+6. **`tokenize`** → **synthesis** (`synthesize_chunk` for ONNX; `mlx::MlxRuntime::synthesize` for MLX —
+   both take the same `(tokens, style, speed)`) → per-chunk `trim_silence` + `apply_fade` + typed
+   silence gap → concat → `resample` → `write_wav`/playback.
 
 When changing any stage, keep these contracts intact: sentinels must survive stages 2–3; punctuation
 in `PRESERVED_PUNCT` must round-trip through stage 4; nothing downstream of stage 4 should see raw
@@ -77,22 +78,27 @@ graphemes.
 
 ## Backends and conditional compilation
 
-Two inference backends selected by `--backend`:
+Two inference backends selected by `--backend` (resolved in `main`: explicit flag wins, else MLX when
+built with `--features mlx`, else ONNX). **Both run the same `kokoro.onnx` + `voices/*.bin`.**
 
-- **ONNX (default)** — `ort` crate with the CoreML execution provider (ANE/GPU, CPU fallback). The
-  compiled CoreML model is cached under `~/Library/Caches/storytime/coreml`. `ort` is configured with
-  `download-binaries`, so no system ONNX Runtime install is needed.
-- **MLX (`--features mlx`)** — Metal GPU via Apple's MLX. The Kokoro model is **ported to Swift** in
-  `mlx-backend/Sources/KokoroMLX/` (`Model.swift`, `Modules.swift`, `ISTFTNet.swift`) and exposed to
-  Rust through `@_cdecl` C functions (`Bridge.swift`, header `include/kokoro_mlx.h`). `cli/build.rs`
-  shells out to `swift build`, links the resulting static lib plus the Swift runtime / Metal /
-  Accelerate frameworks. mlx-swift is a git submodule at `vendor/mlx-swift` (`git submodule update
-  --init`).
+- **ONNX** — `ort` crate with the CoreML execution provider (ANE/GPU, CPU fallback). The compiled
+  CoreML model is cached under `~/Library/Caches/storytime/coreml`. `ort` bundles its runtime
+  (`download-binaries`), so no system ONNX Runtime install is needed.
+- **MLX (`--features mlx`, default in that build)** — interprets `kokoro.onnx` directly on MLX via the
+  mlx-c C API. Lives in `cli/src/mlx/`: `onnx.rs` parses the ONNX protobuf natively (hand-written prost
+  messages, no `protoc`), folding Constants and materializing initializers as mlx arrays; `ops.rs` is
+  the per-op kernel set (the verified spike port); `mod.rs` exposes `MlxRuntime` + `Device` and picks
+  GPU when `gpu_available()`, else CPU. `cli/build.rs` (feature-gated) fetches+cmake-builds mlx-c with
+  Metal into `cli/target/mlx-c/` (cached), links it + the Metal/Accelerate frameworks + `clang_rt.osx`
+  (for `___isPlatformVersionAtLeast`), and runs bindgen over `mlx/c/mlx.h`. No vendored sources.
 
-`main.rs` uses `cfg`-gated duplicate modules — `mod mlx_ffi` (real FFI under `feature = "mlx"`, else a
-stub that errors) and three `mod playback` blocks (macOS AudioToolbox / Linux ALSA / unsupported
-fallback), all pure FFI with no third-party audio crates. When editing one variant, update the others
-so every `cfg` configuration still compiles.
+The full verification story (op-for-op equivalence to ONNX Runtime CPU, the oscillator caveat, the
+CPU≡GPU check) is in `docs/onnx-to-mlx-plan.md`; the standalone parity/`--compare` harness lives in
+`spike/`.
+
+`main.rs` also has three `cfg`-gated `mod playback` blocks (macOS AudioToolbox / Linux ALSA /
+unsupported fallback), pure FFI with no third-party audio crates. When editing one variant, update the
+others so every `cfg` configuration still compiles.
 
 ## Conventions
 

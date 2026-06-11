@@ -12,10 +12,6 @@ assets/
 # Generated audio
 *.wav
 
-# MLX Swift build
-mlx-backend/.build/
-mlx-backend/lib/
-
 # macOS
 .DS_Store
 

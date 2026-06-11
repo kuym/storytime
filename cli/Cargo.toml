@@ -16,10 +16,16 @@ ort = { version = "=2.0.0-rc.10", features = ["coreml", "ndarray", "download-bin
 rubato = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# MLX backend: native ONNX graph parsing (prost runtime only; messages are
+# hand-written, so no protoc / prost-build at build time).
+prost = { version = "0.13", optional = true }
+
+[build-dependencies]
+bindgen = "0.70"
 
 [features]
 default = []
-mlx = []
+mlx = ["dep:prost"]
 
 [profile.release]
 lto = "thin"

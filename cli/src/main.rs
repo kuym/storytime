@@ -27,6 +27,9 @@ use ort::execution_providers::coreml::{
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 
+#[cfg(feature = "mlx")]
+mod mlx;
+
 // ort::Error doesn't implement std::error::Error; bridge via Display.
 fn ort_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
     anyhow!("ort: {e}")
@@ -39,11 +42,12 @@ use serde::Deserialize;
 const NATIVE_SR: u32 = 24_000;
 const STYLE_DIM: usize = 256;
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Backend {
-    /// ONNX Runtime with CoreML execution provider (default).
+    /// ONNX Runtime with the CoreML execution provider.
     Onnx,
-    /// MLX framework via Swift bridge (Apple Silicon GPU).
+    /// Interpret kokoro.onnx directly on MLX (Metal GPU if available, else CPU).
+    /// Requires a build with `--features mlx`; the default in that case.
     Mlx,
 }
 // Most voices are 511 rows; some are 510. Loader accepts either.
@@ -172,17 +176,12 @@ struct Args {
     #[arg(long)]
     no_coreml_cache: bool,
 
-    /// Inference backend. `onnx` uses ONNX Runtime + CoreML EP (default).
-    /// `mlx` uses Apple's MLX framework via a Swift bridge for Metal GPU
-    /// acceleration. The MLX backend requires pre-converted safetensors
-    /// weights (e.g. from mlx-community/Kokoro-82M-bf16 on HuggingFace).
-    #[arg(long, value_enum, default_value_t = Backend::Onnx)]
-    backend: Backend,
-
-    /// Directory holding MLX-format weights (config.json + *.safetensors).
-    /// Only used with `--backend mlx`.
-    #[arg(long)]
-    mlx_weights: Option<PathBuf>,
+    /// Inference backend. `onnx` uses ONNX Runtime + CoreML EP; `mlx`
+    /// interprets the same kokoro.onnx on MLX (Metal GPU if available, else
+    /// CPU). Defaults to `mlx` when built with `--features mlx`, else `onnx`.
+    /// Both use the same model and voice assets.
+    #[arg(long, value_enum)]
+    backend: Option<Backend>,
 
     /// Output WAV path. If omitted, audio plays directly to the default
     /// output device via the OS-native audio API. Use `-` to stream the
@@ -1392,81 +1391,8 @@ fn synthesize_chunk(
     Ok(audio.to_vec())
 }
 
-// ----------------------------------------------------------------------------
-// MLX backend FFI
-// ----------------------------------------------------------------------------
-
-#[cfg(feature = "mlx")]
-mod mlx_ffi {
-    use std::os::raw::c_char;
-
-    #[link(name = "KokoroMLX", kind = "static")]
-    extern "C" {
-        pub fn kokoro_init(weights_dir: *const c_char) -> i32;
-        pub fn kokoro_generate(
-            phonemes: *const c_char,
-            voice_path: *const c_char,
-            speed: f32,
-            n_tokens: i32,
-            audio_out: *mut *mut f32,
-            audio_len: *mut i32,
-        ) -> i32;
-        pub fn kokoro_free_audio(audio: *mut f32);
-        pub fn kokoro_cleanup();
-        pub fn kokoro_sample_rate() -> i32;
-    }
-}
-
-#[cfg(not(feature = "mlx"))]
-mod mlx_ffi {
-    use std::os::raw::c_char;
-    pub unsafe fn kokoro_init(_: *const c_char) -> i32 { -1 }
-    #[allow(unused)]
-    pub unsafe fn kokoro_generate(_: *const c_char, _: *const c_char, _: f32, _: i32,
-                                   _: *mut *mut f32, _: *mut i32) -> i32 { -1 }
-    pub unsafe fn kokoro_free_audio(_: *mut f32) {}
-    #[allow(unused)]
-    pub unsafe fn kokoro_cleanup() {}
-    #[allow(unused)]
-    pub unsafe fn kokoro_sample_rate() -> i32 { 24000 }
-}
-
-#[cfg(feature = "mlx")]
-fn synthesize_mlx(
-    ipa: &str,
-    assets: &Path,
-    voice_name: &str,
-    n_tokens: usize,
-    speed: f32,
-) -> Result<Vec<f32>> {
-    let voice_path = assets.join("mlx").join("voices").join(format!("{voice_name}.safetensors"));
-    let ipa_c = std::ffi::CString::new(ipa)?;
-    let voice_c = std::ffi::CString::new(
-        voice_path.to_str().context("non-UTF8 voice path")?,
-    )?;
-    let mut audio_ptr: *mut f32 = std::ptr::null_mut();
-    let mut audio_len: i32 = 0;
-    let rc = unsafe {
-        mlx_ffi::kokoro_generate(
-            ipa_c.as_ptr(),
-            voice_c.as_ptr(),
-            speed,
-            n_tokens as i32,
-            &mut audio_ptr,
-            &mut audio_len,
-        )
-    };
-    if rc != 0 || audio_ptr.is_null() {
-        bail!("kokoro_generate failed (MLX backend)");
-    }
-    let samples = unsafe {
-        let slice = std::slice::from_raw_parts(audio_ptr, audio_len as usize);
-        let vec = slice.to_vec();
-        mlx_ffi::kokoro_free_audio(audio_ptr);
-        vec
-    };
-    Ok(samples)
-}
+// The MLX backend lives in its own module (cli/src/mlx/): it interprets
+// kokoro.onnx directly on MLX (Metal GPU or CPU) via mlx-c.
 
 fn write_wav(path: &Path, samples: &[f32], sr: u32, depth: BitDepth) -> Result<()> {
     let (bits, fmt) = match depth {
@@ -1553,9 +1479,19 @@ fn main() -> Result<()> {
         args.speed
     );
 
+    // Resolve the backend: explicit `--backend` wins, else default to MLX when
+    // this binary was built with `--features mlx`, otherwise ONNX.
+    let backend = args.backend.unwrap_or(if cfg!(feature = "mlx") {
+        Backend::Mlx
+    } else {
+        Backend::Onnx
+    });
+
     // Initialize the chosen inference backend.
     let mut onnx_session: Option<Session> = None;
-    match args.backend {
+    #[cfg(feature = "mlx")]
+    let mut mlx_rt: Option<mlx::MlxRuntime> = None;
+    match backend {
         Backend::Onnx => {
             ort::init().with_name("storytime").commit().map_err(ort_err)?;
             let cache_dir = resolve_coreml_cache(&args)?;
@@ -1587,27 +1523,13 @@ fn main() -> Result<()> {
 
             #[cfg(feature = "mlx")]
             {
-                let weights_dir = args
-                    .mlx_weights
-                    .as_deref()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| assets.join("mlx"));
-                if !weights_dir.join("config.json").exists() {
-                    bail!(
-                        "MLX weights not found at {}. Download from \
-                         huggingface.co/mlx-community/Kokoro-82M-bf16 \
-                         and pass --mlx-weights PATH.",
-                        weights_dir.display()
-                    );
-                }
-                let dir_cstr = std::ffi::CString::new(
-                    weights_dir.to_str().context("non-UTF8 path")?,
-                )?;
-                let rc = unsafe { mlx_ffi::kokoro_init(dir_cstr.as_ptr()) };
-                if rc != 0 {
-                    bail!("kokoro_init failed (MLX backend)");
-                }
-                eprintln!("storytime: backend=mlx, weights: {}", weights_dir.display());
+                let device = if mlx::gpu_available() {
+                    mlx::Device::Gpu
+                } else {
+                    mlx::Device::Cpu
+                };
+                eprintln!("storytime: backend=mlx, device={:?}", device);
+                mlx_rt = Some(mlx::MlxRuntime::new(&assets.join("kokoro.onnx"), device)?);
             }
         }
     }
@@ -1707,14 +1629,19 @@ fn main() -> Result<()> {
             if tokens.is_empty() {
                 continue;
             }
-            let audio = match args.backend {
+            let style = select_style(&voice, tokens.len());
+            let audio = match backend {
                 Backend::Onnx => {
-                    let style = select_style(&voice, tokens.len());
                     synthesize_chunk(onnx_session.as_mut().unwrap(), &tokens, style, args.speed)?
                 }
                 Backend::Mlx => {
                     #[cfg(feature = "mlx")]
-                    { synthesize_mlx(chunk, &assets, &args.voice, tokens.len(), args.speed)? }
+                    {
+                        mlx_rt
+                            .as_ref()
+                            .unwrap()
+                            .synthesize(&tokens, &style, args.speed)?
+                    }
                     #[cfg(not(feature = "mlx"))]
                     { bail!("MLX backend not compiled in") }
                 }
