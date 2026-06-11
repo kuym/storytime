@@ -30,6 +30,8 @@ use ort::value::Tensor;
 #[cfg(feature = "mlx")]
 mod mlx;
 
+mod script;
+
 // ort::Error doesn't implement std::error::Error; bridge via Display.
 fn ort_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
     anyhow!("ort: {e}")
@@ -188,6 +190,39 @@ struct Args {
     /// WAV to stdout.
     #[arg(short = 'o', long)]
     output: Option<PathBuf>,
+
+    /// Screenplay mode: parse the input as a `NAME: dialogue` script with a
+    /// `# Cast` header that assigns each character a voice, synthesize each
+    /// speech in its character's voice, and mix the result. Incompatible with
+    /// --ipa. See README "Script / multi-voice".
+    #[arg(long)]
+    script: bool,
+
+    /// Read the cast (dramatis personae) from a separate file instead of (or in
+    /// addition to) an inline `# Cast` block. Only meaningful with --script.
+    #[arg(long)]
+    cast: Option<PathBuf>,
+
+    /// Voice for narration lines that have no speaker in script mode. Defaults
+    /// to --voice. A `NARRATOR` cast entry overrides this.
+    #[arg(long)]
+    narrator: Option<String>,
+
+    /// Overlap, in ms, applied when one speech interrupts another (a speech
+    /// ending in `--`/`—`). The interrupter starts this many ms before the
+    /// interrupted speech ends. Script mode only.
+    #[arg(long, default_value_t = 250)]
+    overlap_ms: u32,
+
+    /// Linear gain applied to an interrupted speech's tail as it is overrun by
+    /// the interrupter (1.0 = no ducking, 0.0 = silenced). Script mode only.
+    #[arg(long, default_value_t = 0.4)]
+    duck_gain: f32,
+
+    /// Silence inserted between consecutive (non-overlapping) speeches in script
+    /// mode, in ms.
+    #[arg(long, default_value_t = 120)]
+    line_gap_ms: u32,
 }
 
 /// Boundary between two adjacent audio pieces, ordered by strength.
@@ -274,7 +309,8 @@ fn assets_dir(cli_override: Option<&Path>) -> Result<PathBuf> {
     bail!("could not locate assets/ directory (pass --assets)")
 }
 
-fn list_voices(assets: &Path) -> Result<()> {
+/// Enumerate available voice names (the stems of `voices/*.bin`), sorted.
+fn voice_names(assets: &Path) -> Result<Vec<String>> {
     let dir = assets.join("voices");
     let mut names: Vec<_> = fs::read_dir(&dir)
         .with_context(|| format!("reading {}", dir.display()))?
@@ -289,7 +325,11 @@ fn list_voices(assets: &Path) -> Result<()> {
         })
         .collect();
     names.sort();
-    for n in names {
+    Ok(names)
+}
+
+fn list_voices(assets: &Path) -> Result<()> {
+    for n in voice_names(assets)? {
         println!("{n}");
     }
     Ok(())
@@ -1438,6 +1478,310 @@ fn write_wav(path: &Path, samples: &[f32], sr: u32, depth: BitDepth) -> Result<(
     Ok(())
 }
 
+/// Run one chunk through the selected backend. Both backends take the same
+/// `(tokens, style, speed)` and return 24 kHz mono f32 samples.
+fn synth_chunk_dispatch(
+    backend: Backend,
+    onnx_session: &mut Option<Session>,
+    tokens: &[i64],
+    style: Vec<f32>,
+    speed: f32,
+    #[cfg(feature = "mlx")] mlx_rt: &Option<mlx::MlxRuntime>,
+) -> Result<Vec<f32>> {
+    match backend {
+        Backend::Onnx => synthesize_chunk(onnx_session.as_mut().unwrap(), tokens, style, speed),
+        Backend::Mlx => {
+            #[cfg(feature = "mlx")]
+            {
+                mlx_rt.as_ref().unwrap().synthesize(tokens, &style, speed)
+            }
+            #[cfg(not(feature = "mlx"))]
+            {
+                let _ = (tokens, style, speed);
+                bail!("MLX backend not compiled in")
+            }
+        }
+    }
+}
+
+/// Phonemize `text` (unless `is_ipa`), chunk it under the style-tensor cap, and
+/// synthesize each chunk in `voice`, returning one trimmed+faded buffer per
+/// chunk. Shared by the single-voice path and script mode.
+#[allow(clippy::too_many_arguments)]
+fn synthesize_voice_chunks(
+    text: &str,
+    is_ipa: bool,
+    voice: &Voice,
+    vocab: &HashMap<String, i64>,
+    max_tokens: usize,
+    backend: Backend,
+    onnx_session: &mut Option<Session>,
+    #[cfg(feature = "mlx")] mlx_rt: &Option<mlx::MlxRuntime>,
+    speed: f32,
+    trim_threshold: f32,
+    fade: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let ipa = if is_ipa {
+        text.to_string()
+    } else {
+        run_espeak(text)?
+    };
+    let chunks = chunk_ipa(&ipa, vocab, max_tokens);
+    let mut bufs = Vec::new();
+    for chunk in &chunks {
+        let tokens = tokenize(chunk, vocab);
+        if tokens.is_empty() {
+            continue;
+        }
+        let style = select_style(voice, tokens.len());
+        let audio = synth_chunk_dispatch(
+            backend,
+            onnx_session,
+            &tokens,
+            style,
+            speed,
+            #[cfg(feature = "mlx")]
+            mlx_rt,
+        )?;
+        let mut buf = trim_silence(&audio, trim_threshold).to_vec();
+        apply_fade(&mut buf, fade);
+        bufs.push(buf);
+    }
+    Ok(bufs)
+}
+
+/// Resample to the requested rate and write/stream/play, per `--output`.
+fn emit_audio(samples: &[f32], args: &Args) -> Result<()> {
+    let resampled = resample(samples, NATIVE_SR, args.sample_rate)?;
+    eprintln!(
+        "storytime: {} samples @ {} Hz ({:.2}s)",
+        resampled.len(),
+        args.sample_rate,
+        resampled.len() as f32 / args.sample_rate as f32
+    );
+    match &args.output {
+        Some(path) if path.as_os_str() == "-" => {
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            write_wav_stream(&mut handle, &resampled, args.sample_rate, args.bit_depth)?;
+            eprintln!("storytime: wrote WAV stream to stdout");
+        }
+        Some(path) => {
+            write_wav(path, &resampled, args.sample_rate, args.bit_depth)?;
+            eprintln!("storytime: wrote {}", path.display());
+        }
+        None => {
+            eprintln!("storytime: playing to default output device");
+            playback::play(&resampled, args.sample_rate)?;
+        }
+    }
+    Ok(())
+}
+
+/// A synthesized speech ready for placement on the mix timeline.
+struct TurnAudio {
+    samples: Vec<f32>,
+    interrupts_prev: bool,
+}
+
+/// Apply a linear gain ramp from 1.0 down to `floor` across `out[start..end]`,
+/// ducking an interrupted speaker's tail under the interrupter.
+fn duck_region(out: &mut [f32], start: usize, end: usize, floor: f32) {
+    if end <= start || end > out.len() {
+        return;
+    }
+    let n = (end - start) as f32;
+    for (k, s) in out[start..end].iter_mut().enumerate() {
+        let t = k as f32 / n;
+        *s *= 1.0 - (1.0 - floor) * t;
+    }
+}
+
+/// Mix turns onto a single mono timeline. Non-interrupting turns are laid end to
+/// end separated by `line_gap` samples; an interrupting turn starts `overlap`
+/// samples before the previous turn ends, summed in, with the previous turn's
+/// overlapped tail ducked to `duck_gain`.
+fn mix_timeline(turns: &[TurnAudio], line_gap: usize, overlap: usize, duck_gain: f32) -> Vec<f32> {
+    let mut out: Vec<f32> = Vec::new();
+    let mut prev_end: usize = 0;
+    for (i, t) in turns.iter().enumerate() {
+        let start = if i == 0 {
+            0
+        } else if t.interrupts_prev {
+            prev_end.saturating_sub(overlap)
+        } else {
+            prev_end + line_gap
+        };
+        if i > 0 && t.interrupts_prev && start < prev_end {
+            duck_region(&mut out, start, prev_end, duck_gain);
+        }
+        let end = start + t.samples.len();
+        if out.len() < end {
+            out.resize(end, 0.0);
+        }
+        for (j, &s) in t.samples.iter().enumerate() {
+            out[start + j] += s;
+        }
+        prev_end = end;
+    }
+    out
+}
+
+/// Screenplay mode: parse the script, resolve each character to a voice,
+/// synthesize every speech in its voice, and mix the timeline (with overlapping
+/// interruptions). Reuses the same per-text synthesis path as single-voice mode.
+#[allow(clippy::too_many_arguments)]
+fn run_script(
+    args: &Args,
+    assets: &Path,
+    raw_input: &str,
+    vocab: &HashMap<String, i64>,
+    backend: Backend,
+    onnx_session: &mut Option<Session>,
+    #[cfg(feature = "mlx")] mlx_rt: &Option<mlx::MlxRuntime>,
+    fade: usize,
+) -> Result<()> {
+    // 1. Parse the script (with an optional separate --cast file).
+    let extra_cast = match &args.cast {
+        Some(p) => Some(
+            fs::read_to_string(p).with_context(|| format!("reading cast file {}", p.display()))?,
+        ),
+        None => None,
+    };
+    let parsed = script::parse(raw_input, extra_cast.as_deref())?;
+
+    // 2. Resolve voices. Collect distinct speakers in first-appearance order so
+    //    any label without a cast entry still gets a voice.
+    let available = voice_names(assets)?;
+    if available.is_empty() {
+        bail!("no voices found under {}/voices", assets.display());
+    }
+    let narrator_default = args.narrator.clone().unwrap_or_else(|| args.voice.clone());
+    let mut speakers: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for sp in &parsed.speeches {
+        if seen.insert(sp.character.clone()) {
+            speakers.push(sp.character.clone());
+        }
+    }
+    let (mapping, warnings) =
+        script::resolve_voices(&parsed.cast, &speakers, &available, &narrator_default);
+    for w in &warnings {
+        eprintln!("storytime: warning: {w}");
+    }
+    eprintln!(
+        "storytime: script mode: {} speech(es), {} character(s)",
+        parsed.speeches.len(),
+        speakers.len()
+    );
+    for s in &speakers {
+        eprintln!("storytime:   {s} -> {}", mapping.get(s).map_or("?", |v| v));
+    }
+
+    // 3. Load each distinct voice once. The style cap is the smallest across
+    //    loaded voices so no chunk overruns any voice's row count.
+    let mut voices: HashMap<String, Voice> = HashMap::new();
+    for vid in mapping.values() {
+        if !voices.contains_key(vid) {
+            voices.insert(vid.clone(), load_voice(assets, vid)?);
+        }
+    }
+    let max_tokens = voices
+        .values()
+        .map(|v| v.rows - 1)
+        .min()
+        .expect("at least one voice");
+
+    // 4. Coalesce consecutive same-voice, non-interrupting speeches into one
+    //    turn (joined by the paragraph pause marker) so they become a single,
+    //    longer inference call — the same throughput win the narrator path gets
+    //    from marker merging.
+    struct Turn {
+        voice_id: String,
+        text: String,
+        interrupts_prev: bool,
+    }
+    let mut turns: Vec<Turn> = Vec::new();
+    for sp in &parsed.speeches {
+        let vid = mapping
+            .get(&sp.character)
+            .cloned()
+            .unwrap_or_else(|| narrator_default.clone());
+        let mergeable = !sp.interrupts_prev
+            && turns.last().is_some_and(|t| t.voice_id == vid && !t.interrupts_prev);
+        if mergeable {
+            let last = turns.last_mut().unwrap();
+            last.text.push_str(&args.paragraph_marker);
+            last.text.push_str(&sp.text);
+        } else {
+            turns.push(Turn {
+                voice_id: vid,
+                text: sp.text.clone(),
+                interrupts_prev: sp.interrupts_prev,
+            });
+        }
+    }
+
+    // 5. Synthesize each turn into a single buffer (its chunks joined by the
+    //    chunk gap, as in single-voice mode).
+    let chunk_gap = (NATIVE_SR as usize * args.chunk_gap_ms as usize) / 1000;
+    let mut turns_audio: Vec<TurnAudio> = Vec::new();
+    for (idx, turn) in turns.iter().enumerate() {
+        let voice = &voices[&turn.voice_id];
+        let text = if args.no_markdown {
+            turn.text.clone()
+        } else {
+            preprocess_markdown(&turn.text)
+        };
+        let text = normalize_punctuation(&text);
+        let bufs = synthesize_voice_chunks(
+            &text,
+            false,
+            voice,
+            vocab,
+            max_tokens,
+            backend,
+            onnx_session,
+            #[cfg(feature = "mlx")]
+            mlx_rt,
+            args.speed,
+            args.trim_threshold,
+            fade,
+        )?;
+        let mut samples: Vec<f32> = Vec::new();
+        for (i, b) in bufs.iter().enumerate() {
+            if i > 0 {
+                samples.resize(samples.len() + chunk_gap, 0.0);
+            }
+            samples.extend_from_slice(b);
+        }
+        if samples.is_empty() {
+            continue;
+        }
+        eprintln!(
+            "storytime: turn {}/{} [{}]: {} samples{}",
+            idx + 1,
+            turns.len(),
+            turn.voice_id,
+            samples.len(),
+            if turn.interrupts_prev { " (overlap)" } else { "" }
+        );
+        turns_audio.push(TurnAudio {
+            samples,
+            interrupts_prev: turn.interrupts_prev,
+        });
+    }
+    if turns_audio.is_empty() {
+        bail!("no audio produced from script");
+    }
+
+    // 6. Mix onto a mono timeline and emit.
+    let line_gap = (NATIVE_SR as usize * args.line_gap_ms as usize) / 1000;
+    let overlap = (NATIVE_SR as usize * args.overlap_ms as usize) / 1000;
+    let mixed = mix_timeline(&turns_audio, line_gap, overlap, args.duck_gain);
+    emit_audio(&mixed, args)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -1447,22 +1791,102 @@ fn main() -> Result<()> {
         return list_voices(&assets);
     }
 
-    let input_text = read_input(args.input.as_deref())?;
-    if input_text.trim().is_empty() {
+    let raw_input = read_input(args.input.as_deref())?;
+    if raw_input.trim().is_empty() {
         bail!("input was empty");
     }
 
+    if args.script && args.ipa {
+        bail!("--script and --ipa are mutually exclusive (script mode needs text for espeak-ng)");
+    }
+
+    let vocab = load_tokens(&assets)?;
+
+    // Resolve the backend: explicit `--backend` wins, else default to MLX when
+    // this binary was built with `--features mlx`, otherwise ONNX.
+    let backend = args.backend.unwrap_or(if cfg!(feature = "mlx") {
+        Backend::Mlx
+    } else {
+        Backend::Onnx
+    });
+
+    // Initialize the chosen inference backend (shared by both paths).
+    #[cfg(feature = "mlx")]
+    let mut mlx_rt: Option<mlx::MlxRuntime> = None;
+    let mut onnx_session: Option<Session> = match backend {
+        Backend::Onnx => {
+            ort::init().with_name("storytime").commit().map_err(ort_err)?;
+            let cache_dir = resolve_coreml_cache(&args)?;
+            let mut coreml = CoreMLExecutionProvider::default()
+                .with_model_format(CoreMLModelFormat::NeuralNetwork)
+                .with_compute_units(CoreMLComputeUnits::All)
+                .with_low_precision_accumulation_on_gpu(true);
+            if let Some(dir) = cache_dir.as_ref() {
+                fs::create_dir_all(dir)?;
+                coreml = coreml.with_model_cache_dir(dir.display().to_string());
+                eprintln!("storytime: backend=onnx, coreml cache: {}", dir.display());
+            } else {
+                eprintln!("storytime: backend=onnx, coreml cache disabled");
+            }
+            Some(
+                Session::builder()
+                    .map_err(ort_err)?
+                    .with_optimization_level(GraphOptimizationLevel::Level3)
+                    .map_err(ort_err)?
+                    .with_execution_providers([coreml.build()])
+                    .map_err(ort_err)?
+                    .commit_from_file(assets.join("kokoro.onnx"))
+                    .map_err(ort_err)?,
+            )
+        }
+        Backend::Mlx => {
+            #[cfg(not(feature = "mlx"))]
+            bail!("MLX backend not compiled in. Rebuild with: cargo build --features mlx");
+
+            #[cfg(feature = "mlx")]
+            {
+                let device = if mlx::gpu_available() {
+                    mlx::Device::Gpu
+                } else {
+                    mlx::Device::Cpu
+                };
+                eprintln!("storytime: backend=mlx, device={:?}", device);
+                mlx_rt = Some(mlx::MlxRuntime::new(&assets.join("kokoro.onnx"), device)?);
+                None
+            }
+        }
+    };
+
+    let fade = (NATIVE_SR as usize * args.fade_ms as usize) / 1000;
+
+    // Screenplay mode is a separate front-end: parse the cast + speeches,
+    // resolve voices, synthesize per character, and mix (with overlapping
+    // interruptions). It shares the per-text synthesis path below.
+    if args.script {
+        return run_script(
+            &args,
+            &assets,
+            &raw_input,
+            &vocab,
+            backend,
+            &mut onnx_session,
+            #[cfg(feature = "mlx")]
+            &mlx_rt,
+            fade,
+        );
+    }
+
+    // ---- Single-voice path ----
     // Interpret markdown (unless disabled or in IPA mode, where the input is
     // already phonemes). Emphasis is carried forward as sentinels that become
     // IPA stress in `run_espeak`; all other markers are stripped here so they
     // are never spoken.
     let input_text = if args.no_markdown || args.ipa {
-        input_text
+        raw_input
     } else {
-        preprocess_markdown(&input_text)
+        preprocess_markdown(&raw_input)
     };
 
-    let vocab = load_tokens(&assets)?;
     let voice = load_voice(&assets, &args.voice)?;
     let max_tokens = voice.rows - 1;
 
@@ -1478,63 +1902,6 @@ fn main() -> Result<()> {
         args.voice,
         args.speed
     );
-
-    // Resolve the backend: explicit `--backend` wins, else default to MLX when
-    // this binary was built with `--features mlx`, otherwise ONNX.
-    let backend = args.backend.unwrap_or(if cfg!(feature = "mlx") {
-        Backend::Mlx
-    } else {
-        Backend::Onnx
-    });
-
-    // Initialize the chosen inference backend.
-    let mut onnx_session: Option<Session> = None;
-    #[cfg(feature = "mlx")]
-    let mut mlx_rt: Option<mlx::MlxRuntime> = None;
-    match backend {
-        Backend::Onnx => {
-            ort::init().with_name("storytime").commit().map_err(ort_err)?;
-            let cache_dir = resolve_coreml_cache(&args)?;
-            let mut coreml = CoreMLExecutionProvider::default()
-                .with_model_format(CoreMLModelFormat::NeuralNetwork)
-                .with_compute_units(CoreMLComputeUnits::All)
-                .with_low_precision_accumulation_on_gpu(true);
-            if let Some(dir) = cache_dir.as_ref() {
-                fs::create_dir_all(dir)?;
-                coreml = coreml.with_model_cache_dir(dir.display().to_string());
-                eprintln!("storytime: backend=onnx, coreml cache: {}", dir.display());
-            } else {
-                eprintln!("storytime: backend=onnx, coreml cache disabled");
-            }
-            onnx_session = Some(
-                Session::builder()
-                    .map_err(ort_err)?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)
-                    .map_err(ort_err)?
-                    .with_execution_providers([coreml.build()])
-                    .map_err(ort_err)?
-                    .commit_from_file(assets.join("kokoro.onnx"))
-                    .map_err(ort_err)?,
-            );
-        }
-        Backend::Mlx => {
-            #[cfg(not(feature = "mlx"))]
-            bail!("MLX backend not compiled in. Rebuild with: cargo build --features mlx");
-
-            #[cfg(feature = "mlx")]
-            {
-                let device = if mlx::gpu_available() {
-                    mlx::Device::Gpu
-                } else {
-                    mlx::Device::Cpu
-                };
-                eprintln!("storytime: backend=mlx, device={:?}", device);
-                mlx_rt = Some(mlx::MlxRuntime::new(&assets.join("kokoro.onnx"), device)?);
-            }
-        }
-    }
-
-    let fade = (NATIVE_SR as usize * args.fade_ms as usize) / 1000;
 
     // Accumulate (preceding_gap, audio) pieces so we can insert the right
     // amount of silence between each.
@@ -1615,42 +1982,21 @@ fn main() -> Result<()> {
     );
 
     for (group_idx, group) in groups.iter().enumerate() {
-        let ipa = if args.ipa {
-            group.text.clone()
-        } else {
-            run_espeak(&group.text)?
-        };
-        let chunks = chunk_ipa(&ipa, &vocab, max_tokens);
-        if chunks.is_empty() {
-            continue;
-        }
-        for (chunk_idx, chunk) in chunks.iter().enumerate() {
-            let tokens = tokenize(chunk, &vocab);
-            if tokens.is_empty() {
-                continue;
-            }
-            let style = select_style(&voice, tokens.len());
-            let audio = match backend {
-                Backend::Onnx => {
-                    synthesize_chunk(onnx_session.as_mut().unwrap(), &tokens, style, args.speed)?
-                }
-                Backend::Mlx => {
-                    #[cfg(feature = "mlx")]
-                    {
-                        mlx_rt
-                            .as_ref()
-                            .unwrap()
-                            .synthesize(&tokens, &style, args.speed)?
-                    }
-                    #[cfg(not(feature = "mlx"))]
-                    { bail!("MLX backend not compiled in") }
-                }
-            };
-
-            let trimmed = trim_silence(&audio, args.trim_threshold).to_vec();
-            let mut buf = trimmed;
-            apply_fade(&mut buf, fade);
-
+        let bufs = synthesize_voice_chunks(
+            &group.text,
+            args.ipa,
+            &voice,
+            &vocab,
+            max_tokens,
+            backend,
+            &mut onnx_session,
+            #[cfg(feature = "mlx")]
+            &mlx_rt,
+            args.speed,
+            args.trim_threshold,
+            fade,
+        )?;
+        for (chunk_idx, buf) in bufs.into_iter().enumerate() {
             let gap_before = if pieces.is_empty() {
                 Boundary::None
             } else if chunk_idx == 0 {
@@ -1658,14 +2004,11 @@ fn main() -> Result<()> {
             } else {
                 Boundary::Chunk
             };
-
             eprintln!(
-                "storytime: group {}/{} chunk {}/{}: {} tokens -> {} samples ({:?} gap)",
+                "storytime: group {}/{} chunk {}: {} samples ({:?} gap)",
                 group_idx + 1,
                 groups.len(),
                 chunk_idx + 1,
-                chunks.len(),
-                tokens.len(),
                 buf.len(),
                 gap_before,
             );
@@ -1685,30 +2028,7 @@ fn main() -> Result<()> {
         samples.extend_from_slice(audio);
     }
 
-    let resampled = resample(&samples, NATIVE_SR, args.sample_rate)?;
-    eprintln!(
-        "storytime: {} samples @ {} Hz ({:.2}s)",
-        resampled.len(),
-        args.sample_rate,
-        resampled.len() as f32 / args.sample_rate as f32
-    );
-    match &args.output {
-        Some(path) if path.as_os_str() == "-" => {
-            let stdout = std::io::stdout();
-            let mut handle = stdout.lock();
-            write_wav_stream(&mut handle, &resampled, args.sample_rate, args.bit_depth)?;
-            eprintln!("storytime: wrote WAV stream to stdout");
-        }
-        Some(path) => {
-            write_wav(path, &resampled, args.sample_rate, args.bit_depth)?;
-            eprintln!("storytime: wrote {}", path.display());
-        }
-        None => {
-            eprintln!("storytime: playing to default output device");
-            playback::play(&resampled, args.sample_rate)?;
-        }
-    }
-    Ok(())
+    emit_audio(&samples, &args)
 }
 
 // ----------------------------------------------------------------------------

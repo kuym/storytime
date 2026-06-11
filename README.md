@@ -447,6 +447,63 @@ echo "Test." | storytime \
 storytime --list-voices
 ```
 
+### Script / multi-voice
+
+With `--script`, storytime reads a screenplay where different characters speak
+in different voices. The format is the universal `NAME: dialogue` convention any
+LLM (local or hosted) already produces reliably, plus a `# Cast` header that
+assigns each character a voice. storytime segments the input by speaker,
+synthesizes each speech in that character's voice, and mixes the result —
+including genuine overlap when one character interrupts another.
+
+```sh
+storytime --script -i play.md -o play.wav
+```
+
+A complete example:
+
+```markdown
+# Cast
+ALICE: female, american, young
+BOB: male, british, gruff
+NARRATOR: af_heart            # an explicit voice id also works
+
+---
+
+NARRATOR: They stood at the door, neither willing to move first.
+
+ALICE: Are you sure about this? I really think we should wait and--
+BOB: Stop. We're going in, and that's final.
+
+ALICE: *Fine.* But if this goes wrong, it's on you.
+```
+
+The format (matching is case-insensitive and forgiving, so models don't have to
+be precise):
+
+- **Cast block** — the lines under a `Cast` or `Dramatis Personae` heading, up to
+  the next heading or `---` rule. Each entry is `NAME: voice`, where `voice` is
+  either an explicit voice id (`af_bella`) or a **trait list**. It is never spoken.
+- **Traits** — `gender` (`female`/`male`) and `accent`/language (`american`,
+  `british`, `spanish`, `french`, `hindi`, `italian`, `japanese`, `portuguese`,
+  `mandarin`) are honored exactly, since they are encoded in the voice catalog.
+  Other traits (`young`, `gruff`, `warm`, `deep`, …) are best-effort: they keep
+  each character's voice distinct and make the assignment reproducible, but the
+  catalog can't guarantee a specific timbre. Each character gets a different voice.
+- **Speech** — a line beginning `NAME:` (a declared character, or any name in
+  screenplay all-caps) starts that character's turn; following non-speaker lines,
+  up to a blank line or the next speaker, belong to it.
+- **Narration** — lines with no speaker are spoken by `NARRATOR` (or `--narrator`
+  / `--voice` if no narrator is cast).
+- **Interruptions** — end a speech with `--` or `—` and the next speech overlaps
+  it: the interrupter begins `--overlap-ms` before the first finishes, and the
+  interrupted tail is ducked under it (`--duck-gain`).
+- **Parentheticals** — `(stage directions)` are stripped, not spoken.
+- Markdown inside a speech (`*emphasis*`, quotes, punctuation) works as usual.
+
+Output is mono. The cast can also live in a separate file via `--cast cast.md`,
+leaving the body as pure dialogue. `--script` is incompatible with `--ipa`.
+
 ### Flags
 
 | flag | default | description |
@@ -471,6 +528,12 @@ storytime --list-voices
 | `--trim-threshold` | `0.005` | amplitude below which per-chunk leading/trailing silence is trimmed (`0` disables) |
 | `--coreml-cache PATH` | `~/Library/Caches/storytime/coreml` | where CoreML stores its compiled model between runs |
 | `--no-coreml-cache` | off | disable the cache (forces recompilation each run) |
+| `--script` | off | screenplay mode: `NAME: dialogue` with a `# Cast` header (see [Script / multi-voice](#script--multi-voice)) |
+| `--cast PATH` | *(unset)* | read the cast from a separate file (script mode) |
+| `--narrator NAME` | *(= `--voice`)* | voice for unattributed narration (script mode) |
+| `--overlap-ms` | `250` | overlap when one speech interrupts another (script mode) |
+| `--duck-gain` | `0.4` | gain applied to an interrupted speech's tail under the interrupter (script mode) |
+| `--line-gap-ms` | `120` | silence between consecutive non-overlapping speeches (script mode) |
 
 ### Voices
 
