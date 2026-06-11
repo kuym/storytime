@@ -10,7 +10,7 @@ use std::process::Command;
 
 const MLX_C_REPO: &str = "https://github.com/ml-explore/mlx-c.git";
 // Pinned mlx-c commit (regenerated bindings for MLX 0.31.2).
-const MLX_C_REV: &str = "fba4470c39a06ed98c5af0f6e07ba35e89b9a444";
+const MLX_C_REV: &str = "fba4470b89073180056c9ea46c443051375f7399";
 
 fn main() {
     if env::var("CARGO_FEATURE_MLX").is_err() {
