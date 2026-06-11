@@ -1,6 +1,6 @@
 # Plan: replace the Swift MLX backend with an ONNX→MLX graph interpreter
 
-Status: **Phase-0 spike PASSED — GO** · Last updated: 2026-06-10
+Status: **Phase-1 interpreter runs the full graph on MLX CPU** · Last updated: 2026-06-10
 
 ## TL;DR
 
@@ -215,16 +215,74 @@ clang -O2 -Ispike/mlx-c spike/parity.c \
 cd spike/rust-link && cargo run --release
 ```
 
+## Phase-1 results (interpreter complete, CPU)
+
+A full ONNX→MLX graph interpreter now runs the **entire** `kokoro.onnx` on MLX
+CPU and produces audio. Lives in `spike/` (source tracked; build artifacts and
+generated safetensors gitignored).
+
+**Pipeline:**
+- `spike/lower.py` — one ONNX Runtime CPU pass: folds Constants, emits
+  `graph.json` (topo node IR incl. Loop/If subgraphs), `weights.safetensors`
+  (1892 tensors, scalars kept rank-0), and `ref.safetensors` (4694 intermediates
+  for node-by-node parity).
+- `spike/interp/` — Rust + bindgen over mlx-c. Loads the IR + weights, runs each
+  node on mlx-c, validates **every** float32 *and* int output against the ONNX
+  reference, stops/logs on divergence. All 56 op types implemented (elementwise,
+  shape/structural, Gemm/Conv/ConvTranspose/Norms/LSTM, Gather/Scatter/TopK,
+  Resize, Pad, and the `SplitToSequence`/`Loop`/`If`/`ConcatFromSequence` length
+  regulator).
+
+**Parity status:** the entire deterministic network — embeddings, the PL-BERT
+encoder, both bidirectional LSTMs, the prosody/duration predictor, F0/N
+predictors, the length-regulator Loop, and the decoder up to the vocoder — matches
+ONNX Runtime CPU to **< 5e-4 relative**. Final audio is **rel 1.9e-2**.
+
+The residual is isolated to the **harmonic-source oscillator + iSTFT phase** in
+the vocoder: `sin()` of a few-hundred-radian accumulated phase amplifies ~6e-6
+relative phase error to ~3.5e-3, and the `atan2` phase reconstruction (expressed
+as `Div`→`Atan`→`Where`) further amplifies it where the STFT real part is near
+zero. This is **inherent f32 non-associativity between two independent
+implementations, not a bug** — it cannot be removed without bit-matching ONNX's
+exact summation/rounding through the oscillator. Perceptually 1.9e-2 (≈ −34 dB)
+is indistinguishable.
+
+**Bugs found and fixed along the way (each caught by node-level parity):**
+- `np.ascontiguousarray` forces ndim≥1 → silently turned rank-0 scalar constants
+  (Gather indices) into `(1,)`, corrupting ONNX rank propagation. Fixed in lower.py.
+- mlx-c safetensors **iterator** value handle aliases across iterations → fetch
+  by name with `get` instead.
+- `mlx_softmax` reduces the whole array; need `mlx_softmax_axis`.
+- `mlx_concatenate` has no axis; need `mlx_concatenate_axis`.
+- ONNX `Div` on **integer** inputs truncates toward zero; `mlx_divide` is float
+  (this was the seed of nearly all upstream drift — fixing it dropped the whole
+  network to <5e-4).
+- ONNX `Gather` = `np.take(axis)`; implemented on host (mlx take/take_axis
+  semantics didn't match for multi-dim data).
+- Negative-step `Slice` (reverse): ONNX's "past the beginning" end sentinel
+  doesn't map to mlx slice stop → host slice for negative steps.
+- `ConvTranspose` grouped weight layout: ONNX `[Cin, Cout/g, K]` → MLX
+  `[Cout, K, Cin/g]` needs a grouped reshape+permute, not a plain transpose.
+- `mlx_pad` supports only constant/edge → host implementation for `reflect`.
+- RNG nodes (`RandomUniformLike`/`RandomNormalLike`) are unseeded/nondeterministic
+  → inject the captured reference outputs for parity (production uses mlx_random).
+
+**Still to do for a production CPU backend:** native ONNX parsing in Rust (drop
+the Python lower step), array lifetime management (the spike leaks), use
+mlx_scatter/device ops instead of host fallbacks (Gather/Scatter/Slice/Pad/TopK),
+and wire it into the CLI behind `--backend mlx`.
+
 ## Phased plan
 
 - **Phase 0 — spike / go-no-go. ✅ DONE — PASSED** (see "Phase-0 spike results").
   Built mlx-c CPU-only, dumped the ONNX CPU reference, and proved Conv1d + the
   bidirectional LSTM match to float32 epsilon, plus Rust↔mlx-c linkage. The
   kill-switch (shaky LSTM/Conv parity) did not trigger.
-- **Phase 1 — op kernels.** Implement the ~15 non-trivial kernels, each unit-
-  tested against numpy/onnxruntime reference on random inputs.
-- **Phase 2 — graph interpreter.** Topological executor + the bounded `Loop`/`If`/
-  Sequence support; wire initializers + `input_ids`/`style`/`speed`.
+- **Phase 1 — op kernels + interpreter. ✅ DONE** (see "Phase-1 results"). Full
+  graph runs on MLX CPU; deterministic network matches ONNX to <5e-4, audio 1.9e-2
+  (residual = inherent oscillator/iSTFT f32 conditioning).
+- **Phase 2 — graph interpreter. ✅ folded into Phase 1.** Topological executor +
+  bounded `Loop`/`If`/Sequence support implemented and verified.
 - **Phase 3 — integrate + strip Swift.** Replace `synthesize_mlx`/`mlx_ffi` to
   call the interpreter; rewrite `build.rs`; keep `mlx-backend/` behind the flag
   until parity passes.

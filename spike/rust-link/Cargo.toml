@@ -1,0 +1,8 @@
+[package]
+name = "mlx-link-test"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "mlx-link-test"
+path = "src/main.rs"

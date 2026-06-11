@@ -18,3 +18,13 @@ mlx-backend/lib/
 
 # macOS
 .DS_Store
+
+# Phase-1 ONNX->MLX spike: track source, ignore heavy artifacts
+spike/mlx-c/
+spike/*/target/
+spike/art/
+spike/td/
+spike/ref_tensors.npz
+spike/parity
+spike/interp/Cargo.lock
+spike/rust-link/Cargo.lock
