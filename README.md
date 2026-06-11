@@ -355,6 +355,33 @@ In `--ipa` mode, structural parsing still runs: preserve blank lines in
 your piped IPA to get paragraph/section gaps, or use `# ` / `## `
 prefixes to mark chapter/section boundaries.
 
+### Markdown formatting
+
+Text input is treated as Markdown by default. Formatting markers are
+*interpreted* and then stripped, so they are never spoken, and emphasis is
+translated into Kokoro's phoneme-level stress:
+
+| Markdown | Effect on speech |
+|---|---|
+| `*italic*` / `_italic_` | **Stressed** — the word's primary-stressed vowel is lengthened (one `ː`). |
+| `**bold**` / `__bold__` | **Emphasized** — a stronger, more drawn-out lengthening (two `ː`). |
+| `# ` / `## ` / `### ` headings | Marker stripped; boundary strength upgraded (see above). |
+| `[text](url)`, `[text][ref]`, `![alt](url)` | Collapsed to their visible text (`text` / `alt`); the URL is dropped. |
+| `` `code` `` and fenced ``` ``` ``` ``` blocks | Backticks/fences removed; the contents are kept and spoken as plain text. |
+| `- ` / `* ` / `+ ` / `1. ` list bullets | Bullet removed; item text kept. |
+| `> ` blockquotes, `---`/`***`/`___` rules, `~~strike~~` | Markers removed. |
+
+Emphasis works because Kokoro consumes IPA and is trained on the stress
+(`ˈ`/`ˌ`) and length (`ː`) tokens that the upstream Misaki G2P produces.
+storytime ensures the emphasized word carries a primary-stress mark and then
+lengthens its stressed vowel — so `She was **very** happy` phonemizes the
+emphasized word as `vˈɛːːɹi` rather than a flat `vˈɛɹi`. Underscores only
+emphasize at word boundaries, so identifiers like `do_a_thing` are left alone.
+
+Pass `--no-markdown` to take the input as literal text instead (no stripping,
+no emphasis). `--ipa` mode implies `--no-markdown`, since the input is already
+phonemes.
+
 ### Streaming to stdout
 
 Passing `-o -` writes the WAV to stdout so the output can be piped

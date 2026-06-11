@@ -97,6 +97,14 @@ struct Args {
     #[arg(long)]
     ipa: bool,
 
+    /// Disable markdown preprocessing. By default markdown formatting is
+    /// interpreted: bold (`**`/`__`) becomes emphasized speech, italic
+    /// (`*`/`_`) becomes stressed speech, and other markers (headings aside)
+    /// are stripped so they are not vocalized. With this flag the input is
+    /// taken as literal text. Implied by --ipa (input is already phonemes).
+    #[arg(long)]
+    no_markdown: bool,
+
     /// Directory holding kokoro.onnx, tokens.json, voices/*.bin.
     /// Defaults to ../assets relative to the binary.
     #[arg(long)]
@@ -512,6 +520,393 @@ fn normalize_punctuation(text: &str) -> String {
     out
 }
 
+// ----------------------------------------------------------------------------
+// Markdown preprocessing
+//
+// Markdown formatting is interpreted before structural parsing: emphasis is
+// translated into IPA stress (so bold/italic produce emphasized/stressed
+// speech), and every other marker is stripped so it is never vocalized.
+//
+// Emphasis can't be applied here directly — stress lives in phoneme space,
+// downstream of espeak-ng — so emphasized spans are wrapped in private-use
+// sentinel characters. The sentinels ride untouched through `parse_structure`
+// and `normalize_punctuation` (they are neither whitespace, heading prefixes,
+// `.`, nor `"`), and `run_espeak` finally consumes them, applying the matching
+// IPA stress to the enclosed phonemes. They are never sent to espeak-ng or the
+// model and never reach the token stream.
+// ----------------------------------------------------------------------------
+
+/// Strength of emphasis on a span, derived from markdown markers:
+/// `*italic*`/`_italic_` -> Mild (extra stress), `**bold**`/`__bold__` -> Strong.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Emph {
+    None,
+    Mild,
+    Strong,
+}
+
+const SENT_BOLD_OPEN: char = '\u{E000}';
+const SENT_BOLD_CLOSE: char = '\u{E001}';
+const SENT_ITAL_OPEN: char = '\u{E002}';
+const SENT_ITAL_CLOSE: char = '\u{E003}';
+
+/// Strip markdown formatting from `input`, translating emphasis into emphasis
+/// sentinels and removing every other marker so it is not spoken. Heading
+/// markers (`# `/`## `/`### `) and blank-line structure are deliberately left
+/// intact for `parse_structure`. Operates line-by-line so block constructs
+/// (fenced code, rules, blockquotes, list bullets) are handled before inline
+/// ones (links/images, code spans, emphasis, strikethrough).
+fn preprocess_markdown(input: &str) -> String {
+    let input = input.replace("\r\n", "\n");
+    let mut out: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in input.split('\n') {
+        let trimmed = line.trim_start();
+        // Fenced code delimiters (``` or ~~~): drop the fence line; keep the
+        // body as plain text (markers stripped, content preserved).
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push(String::new());
+            continue;
+        }
+        if in_fence {
+            out.push(line.to_string());
+            continue;
+        }
+        // Horizontal rule (--- / *** / ___): becomes a blank line so it acts as
+        // a structural break rather than three spoken characters.
+        if is_hr(trimmed) {
+            out.push(String::new());
+            continue;
+        }
+        let l = strip_blockquote(line);
+        let l = strip_list_marker(&l);
+        out.push(inline_md(&l));
+    }
+    out.join("\n")
+}
+
+/// True if `s` is a markdown horizontal rule: three or more of the same
+/// `- `, `*`, or `_` character, whitespace aside.
+fn is_hr(s: &str) -> bool {
+    let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.len() < 3 {
+        return false;
+    }
+    let first = compact.chars().next().unwrap();
+    matches!(first, '-' | '*' | '_') && compact.chars().all(|c| c == first)
+}
+
+/// Remove leading blockquote markers (`>`), including nested ones.
+fn strip_blockquote(line: &str) -> String {
+    let mut l = line;
+    loop {
+        let t = l.trim_start();
+        match t.strip_prefix('>') {
+            Some(rest) => l = rest,
+            None => return t.to_string(),
+        }
+    }
+}
+
+/// Remove a leading list bullet (`- `, `+ `, `* `) or ordered marker
+/// (`1.`/`1)` followed by a space). The trailing space is required so that
+/// line-leading emphasis like `*italic*` is not mistaken for a bullet.
+fn strip_list_marker(line: &str) -> String {
+    let t = line.trim_start();
+    for m in ['-', '+', '*'] {
+        if let Some(rest) = t.strip_prefix(m) {
+            if let Some(after) = rest.strip_prefix(' ') {
+                return after.trim_start().to_string();
+            }
+        }
+    }
+    let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 {
+        let rest = &t[digits..];
+        if let Some(r) = rest.strip_prefix('.').or_else(|| rest.strip_prefix(')')) {
+            if let Some(after) = r.strip_prefix(' ') {
+                return after.trim_start().to_string();
+            }
+        }
+    }
+    t.to_string()
+}
+
+/// Apply inline markdown transforms to a single line. Code spans are detected
+/// first by splitting on backticks so their contents are emitted verbatim
+/// (markers dropped) and never reinterpreted as emphasis.
+fn inline_md(line: &str) -> String {
+    let mut out = String::new();
+    for (i, seg) in line.split('`').enumerate() {
+        if i % 2 == 1 {
+            // Inside a code span: emit content verbatim, sans backticks.
+            out.push_str(seg);
+        } else {
+            out.push_str(&transform_inline(seg));
+        }
+    }
+    out
+}
+
+/// Collapse links/images to their text, drop strikethrough markers, then turn
+/// emphasis into sentinels. Order matters: links are resolved first so URLs
+/// (which may contain `_`) are gone before emphasis scanning.
+fn transform_inline(seg: &str) -> String {
+    let s = strip_links(seg);
+    let s = s.replace("~~", "");
+    parse_emphasis(&s)
+}
+
+/// Replace `[text](url)`, `[text][ref]`, and `![alt](url)` with their visible
+/// text. Brackets that don't form a link are left as literal characters.
+fn strip_links(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        // Image: drop the leading '!', leaving the [alt](url) for the next step.
+        if c == '!' && i + 1 < n && chars[i + 1] == '[' {
+            i += 1;
+            continue;
+        }
+        if c == '[' {
+            if let Some(close) = matching(&chars, i, '[', ']') {
+                let after = close + 1;
+                // Inline `[text](url)` or reference `[text][id]`: keep the text,
+                // drop the brackets and the destination/label that follows.
+                let link_end = match chars.get(after) {
+                    Some('(') => find_from(&chars, after, ')'),
+                    Some('[') => find_from(&chars, after, ']'),
+                    _ => None,
+                };
+                if let Some(end) = link_end {
+                    out.extend(chars[i + 1..close].iter());
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Index of the close char that balances the open char at `open`, honoring
+/// nesting. Returns None if unbalanced.
+fn matching(chars: &[char], open: usize, oc: char, cc: char) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, &c) in chars.iter().enumerate().skip(open) {
+        if c == oc {
+            depth += 1;
+        } else if c == cc {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn find_from(chars: &[char], start: usize, target: char) -> Option<usize> {
+    (start..chars.len()).find(|&i| chars[i] == target)
+}
+
+/// Map the (minimum) length of a matched `*`/`_` delimiter run to a strength:
+/// one marker is italic (Mild), two or more is bold (Strong).
+fn emph_level(run_len: usize) -> Emph {
+    match run_len {
+        0 => Emph::None,
+        1 => Emph::Mild,
+        _ => Emph::Strong,
+    }
+}
+
+/// Rewrite markdown emphasis (`*`/`_` runs) into emphasis sentinels. A
+/// CommonMark-lite delimiter matcher: runs are matched closer-to-opener with a
+/// stack, the strength taken from the shorter run; underscores only emphasize
+/// at word boundaries (so `snake_case` is left alone), and unmatched runs are
+/// emitted as literal characters.
+fn parse_emphasis(s: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum Run {
+        Text(usize, usize),
+        Delim {
+            ch: char,
+            len: usize,
+            can_open: bool,
+            can_close: bool,
+        },
+    }
+
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+
+    // 1. Tokenize into text spans and maximal delimiter runs.
+    let mut runs: Vec<Run> = Vec::new();
+    let mut i = 0;
+    let mut text_start = 0;
+    while i < n {
+        let c = chars[i];
+        if c == '*' || c == '_' {
+            if text_start < i {
+                runs.push(Run::Text(text_start, i));
+            }
+            let mut j = i;
+            while j < n && chars[j] == c {
+                j += 1;
+            }
+            let prev = i.checked_sub(1).map(|k| chars[k]);
+            let next = chars.get(j).copied();
+            let left_flank = next.is_some_and(|x| !x.is_whitespace());
+            let right_flank = prev.is_some_and(|x| !x.is_whitespace());
+            let (can_open, can_close) = if c == '_' {
+                (
+                    left_flank && prev.is_none_or(|x| !x.is_alphanumeric()),
+                    right_flank && next.is_none_or(|x| !x.is_alphanumeric()),
+                )
+            } else {
+                (left_flank, right_flank)
+            };
+            runs.push(Run::Delim {
+                ch: c,
+                len: j - i,
+                can_open,
+                can_close,
+            });
+            i = j;
+            text_start = j;
+        } else {
+            i += 1;
+        }
+    }
+    if text_start < n {
+        runs.push(Run::Text(text_start, n));
+    }
+
+    // 2. Match closers to openers; record each matched run's role + strength.
+    #[derive(Clone, Copy)]
+    enum Role {
+        None,
+        Open(Emph),
+        Close(Emph),
+    }
+    let mut roles = vec![Role::None; runs.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for idx in 0..runs.len() {
+        if let Run::Delim {
+            ch, len, can_open, can_close, ..
+        } = runs[idx]
+        {
+            if can_close {
+                if let Some(si) = stack
+                    .iter()
+                    .rposition(|&oi| matches!(runs[oi], Run::Delim { ch: o, .. } if o == ch))
+                {
+                    let oidx = stack[si];
+                    let olen = match runs[oidx] {
+                        Run::Delim { len, .. } => len,
+                        _ => 1,
+                    };
+                    let level = emph_level(olen.min(len));
+                    roles[oidx] = Role::Open(level);
+                    roles[idx] = Role::Close(level);
+                    stack.truncate(si); // discard openers left unmatched inside
+                    continue;
+                }
+            }
+            if can_open {
+                stack.push(idx);
+            }
+        }
+    }
+
+    // 3. Rebuild: matched delimiters become sentinels, the rest stay literal.
+    let mut out = String::new();
+    for (idx, run) in runs.iter().enumerate() {
+        match *run {
+            Run::Text(a, b) => out.extend(chars[a..b].iter()),
+            Run::Delim { ch, len, .. } => match roles[idx] {
+                Role::Open(Emph::Strong) => out.push(SENT_BOLD_OPEN),
+                Role::Open(Emph::Mild) => out.push(SENT_ITAL_OPEN),
+                Role::Close(Emph::Strong) => out.push(SENT_BOLD_CLOSE),
+                Role::Close(Emph::Mild) => out.push(SENT_ITAL_CLOSE),
+                _ => (0..len).for_each(|_| out.push(ch)),
+            },
+        }
+    }
+    out
+}
+
+/// IPA vowel symbols espeak-ng emits for en-us, used to find the nucleus of the
+/// primary-stressed syllable so emphasis can lengthen it.
+const IPA_VOWELS: &str = "iɪeɛæəɐʌɜɚɝɑɒɔoɵʊuʉayøœ";
+
+fn is_ipa_vowel(c: char) -> bool {
+    IPA_VOWELS.contains(c)
+}
+
+/// Apply emphasis to one phonemized word: ensure a primary stress mark is
+/// present, then lengthen the primary-stressed vowel by `extra` length marks
+/// (`ː`). espeak already marks lexical stress, so the lengthening is what makes
+/// the word audibly stand out; an unstressed function word with no mark gets a
+/// primary mark prepended at its onset.
+fn emphasize_word(ipa: &str, extra: usize) -> String {
+    let mut s = ipa.to_string();
+    if !s.contains('ˈ') {
+        if let Some(pos) = s.find('ˌ') {
+            s.replace_range(pos..pos + 'ˌ'.len_utf8(), "ˈ");
+        } else {
+            s.insert(0, 'ˈ');
+        }
+    }
+    if extra == 0 {
+        return s;
+    }
+    let Some(stress) = s.find('ˈ') else {
+        return s;
+    };
+    let after = stress + 'ˈ'.len_utf8();
+    // End of the first contiguous vowel run after the stress mark.
+    let mut vowel_end: Option<usize> = None;
+    for (off, c) in s[after..].char_indices() {
+        if is_ipa_vowel(c) {
+            vowel_end = Some(after + off + c.len_utf8());
+        } else if vowel_end.is_some() {
+            break;
+        }
+    }
+    if let Some(end) = vowel_end {
+        let marks: String = std::iter::repeat('ː').take(extra).collect();
+        s.insert_str(end, &marks);
+    }
+    s
+}
+
+/// Apply emphasis across a phonemized span (one or more space-separated words),
+/// lengthening each word's stressed vowel: Mild adds one `ː`, Strong two.
+fn apply_emphasis_to_ipa(ipa: &str, level: Emph) -> String {
+    let extra = match level {
+        Emph::None => return ipa.to_string(),
+        Emph::Mild => 1,
+        Emph::Strong => 2,
+    };
+    ipa.split(' ')
+        .map(|w| {
+            if w.is_empty() {
+                String::new()
+            } else {
+                emphasize_word(w, extra)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Run espeak-ng for grapheme->IPA conversion, preserving punctuation.
 ///
 /// The strategy is: split the input on every preserved punctuation
@@ -523,24 +918,50 @@ fn normalize_punctuation(text: &str) -> String {
 fn run_espeak(text: &str) -> Result<String> {
     #[derive(Debug)]
     enum Piece<'a> {
-        Text(&'a str),
+        Text(&'a str, Emph),
         Punct(char),
     }
 
-    // 1. Split input on preserved-punctuation boundaries.
+    // 1. Split input on preserved-punctuation and emphasis-sentinel boundaries.
+    //    Sentinels are consumed here — they never reach espeak-ng or the model;
+    //    instead they toggle the emphasis level carried by the text that
+    //    follows, which becomes IPA stress in step 3.
     let mut pieces: Vec<Piece> = Vec::new();
     let mut cur = 0usize;
+    let mut bold = 0i32;
+    let mut ital = 0i32;
+    let level = |b: i32, i: i32| -> Emph {
+        if b > 0 {
+            Emph::Strong
+        } else if i > 0 {
+            Emph::Mild
+        } else {
+            Emph::None
+        }
+    };
     for (i, ch) in text.char_indices() {
-        if PRESERVED_PUNCT.contains(ch) {
+        let sentinel =
+            matches!(ch, SENT_BOLD_OPEN | SENT_BOLD_CLOSE | SENT_ITAL_OPEN | SENT_ITAL_CLOSE);
+        if sentinel || PRESERVED_PUNCT.contains(ch) {
             if cur < i {
-                pieces.push(Piece::Text(&text[cur..i]));
+                pieces.push(Piece::Text(&text[cur..i], level(bold, ital)));
             }
-            pieces.push(Piece::Punct(ch));
+            if sentinel {
+                match ch {
+                    SENT_BOLD_OPEN => bold += 1,
+                    SENT_BOLD_CLOSE => bold = (bold - 1).max(0),
+                    SENT_ITAL_OPEN => ital += 1,
+                    SENT_ITAL_CLOSE => ital = (ital - 1).max(0),
+                    _ => {}
+                }
+            } else {
+                pieces.push(Piece::Punct(ch));
+            }
             cur = i + ch.len_utf8();
         }
     }
     if cur < text.len() {
-        pieces.push(Piece::Text(&text[cur..]));
+        pieces.push(Piece::Text(&text[cur..], level(bold, ital)));
     }
 
     // 2. Collect non-empty text segments, one per line, for espeak-ng.
@@ -549,7 +970,7 @@ fn run_espeak(text: &str) -> Result<String> {
     let text_segments: Vec<&str> = pieces
         .iter()
         .filter_map(|p| match p {
-            Piece::Text(s) if !s.trim().is_empty() => Some(*s),
+            Piece::Text(s, _) if !s.trim().is_empty() => Some(*s),
             _ => None,
         })
         .collect();
@@ -586,24 +1007,38 @@ fn run_espeak(text: &str) -> Result<String> {
     //    survives the rebuild (espeak output has no leading space).
     let mut result = String::new();
     let mut ipa_iter = ipa_lines.into_iter();
+    let mut prev_trailing_ws = false;
     for (i, piece) in pieces.iter().enumerate() {
         match piece {
-            Piece::Text(s) => {
+            Piece::Text(s, emph) => {
                 if s.trim().is_empty() {
                     continue;
                 }
-                if let Some(ipa) = ipa_iter.next() {
-                    result.push_str(&ipa);
+                // A sentinel can split mid-phrase where the only separator was a
+                // space (e.g. `say **boo**`); the trim above would drop it, so
+                // re-insert a single gap between adjacent text pieces when the
+                // original had whitespace at the boundary.
+                let leading_ws = s.starts_with(char::is_whitespace);
+                if !result.is_empty()
+                    && !result.ends_with(' ')
+                    && (prev_trailing_ws || leading_ws)
+                {
+                    result.push(' ');
                 }
+                if let Some(ipa) = ipa_iter.next() {
+                    result.push_str(&apply_emphasis_to_ipa(&ipa, *emph));
+                }
+                prev_trailing_ws = s.ends_with(char::is_whitespace);
             }
             Piece::Punct(c) => {
                 result.push(*c);
                 let more_text_follows = pieces[i + 1..]
                     .iter()
-                    .any(|p| matches!(p, Piece::Text(s) if !s.trim().is_empty()));
+                    .any(|p| matches!(p, Piece::Text(s, _) if !s.trim().is_empty()));
                 if more_text_follows {
                     result.push(' ');
                 }
+                prev_trailing_ws = false;
             }
         }
     }
@@ -1090,6 +1525,16 @@ fn main() -> Result<()> {
     if input_text.trim().is_empty() {
         bail!("input was empty");
     }
+
+    // Interpret markdown (unless disabled or in IPA mode, where the input is
+    // already phonemes). Emphasis is carried forward as sentinels that become
+    // IPA stress in `run_espeak`; all other markers are stripped here so they
+    // are never spoken.
+    let input_text = if args.no_markdown || args.ipa {
+        input_text
+    } else {
+        preprocess_markdown(&input_text)
+    };
 
     let vocab = load_tokens(&assets)?;
     let voice = load_voice(&assets, &args.voice)?;
@@ -1623,5 +2068,91 @@ mod playback {
     use anyhow::{bail, Result};
     pub fn play(_samples: &[f32], _sample_rate: u32) -> Result<()> {
         bail!("direct playback is only implemented on macOS and Linux; pass -o PATH to write a WAV instead");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Convenience: render the sentinels visibly so assertions read clearly.
+    fn show(s: &str) -> String {
+        s.replace(SENT_BOLD_OPEN, "<b>")
+            .replace(SENT_BOLD_CLOSE, "</b>")
+            .replace(SENT_ITAL_OPEN, "<i>")
+            .replace(SENT_ITAL_CLOSE, "</i>")
+    }
+
+    #[test]
+    fn emphasis_to_sentinels() {
+        assert_eq!(show(&parse_emphasis("a **bold** b")), "a <b>bold</b> b");
+        assert_eq!(show(&parse_emphasis("a *italic* b")), "a <i>italic</i> b");
+        assert_eq!(show(&parse_emphasis("a __bold__ b")), "a <b>bold</b> b");
+        assert_eq!(show(&parse_emphasis("a _italic_ b")), "a <i>italic</i> b");
+        // Triple markers collapse to the strong (bold) span.
+        assert_eq!(show(&parse_emphasis("a ***x*** b")), "a <b>x</b> b");
+        // Multi-word spans keep their inner spaces.
+        assert_eq!(
+            show(&parse_emphasis("the **big bad wolf**")),
+            "the <b>big bad wolf</b>"
+        );
+    }
+
+    #[test]
+    fn underscores_only_emphasize_at_word_boundaries() {
+        // snake_case must survive untouched.
+        assert_eq!(parse_emphasis("call do_a_thing now"), "call do_a_thing now");
+        // A stray, unmatched marker is emitted literally.
+        assert_eq!(parse_emphasis("2 * 3 = 6"), "2 * 3 = 6");
+    }
+
+    #[test]
+    fn strips_links_images_and_inline_code() {
+        assert_eq!(inline_md("see [the docs](https://x.io) now"), "see the docs now");
+        assert_eq!(inline_md("![a cat](cat.png) sat"), "a cat sat");
+        assert_eq!(inline_md("run `cargo build` first"), "run cargo build first");
+        // Reference-style link.
+        assert_eq!(inline_md("see [the docs][1]"), "see the docs");
+        // Bare brackets are not a link and stay literal.
+        assert_eq!(inline_md("a [b] c"), "a [b] c");
+    }
+
+    #[test]
+    fn strips_block_markers_but_keeps_headings() {
+        let md = "# Title\n\n> quoted line\n\n- one\n- two\n\n---\n\nplain";
+        let out = preprocess_markdown(md);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.contains(&"# Title")); // heading marker preserved
+        assert!(lines.contains(&"quoted line")); // blockquote stripped
+        assert!(lines.contains(&"one")); // bullet stripped
+        assert!(lines.contains(&"two"));
+        assert!(lines.contains(&"plain"));
+        assert!(!out.contains('>'));
+        assert!(!out.contains("---"));
+        assert!(!out.contains("- ")); // no bullet markers remain
+    }
+
+    #[test]
+    fn emphasize_word_lengthens_stressed_vowel() {
+        // Mild adds one length mark after the primary-stressed vowel.
+        assert_eq!(emphasize_word("bˈuː", 1), "bˈuːː");
+        // Strong adds two.
+        assert_eq!(emphasize_word("bˈæd", 2), "bˈæːːd");
+        // A word lacking any stress mark gets a primary mark prepended.
+        assert!(emphasize_word("ðə", 1).starts_with('ˈ'));
+        // A secondary mark is promoted to primary rather than prepended.
+        let promoted = emphasize_word("ˌæbc", 0);
+        assert!(promoted.contains('ˈ') && !promoted.contains('ˌ'));
+        // None level is a no-op.
+        assert_eq!(apply_emphasis_to_ipa("bˈuː", Emph::None), "bˈuː");
+    }
+
+    #[test]
+    fn apply_emphasis_handles_multiword_spans() {
+        // Each word's stressed vowel is lengthened independently.
+        assert_eq!(
+            apply_emphasis_to_ipa("bˈɪɡ bˈæd", Emph::Strong),
+            "bˈɪːːɡ bˈæːːd"
+        );
     }
 }
