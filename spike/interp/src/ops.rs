@@ -409,10 +409,42 @@ fn run_node(n: &Node, env: &mut Env, refmap: &HashMap<String, mlx_array>) -> Vec
         }
 
         "RandomUniformLike" | "RandomNormalLike" => {
-            let r = refmap
-                .get(&n.output[0])
-                .unwrap_or_else(|| panic!("RNG output not captured: {}", n.output[0]));
-            one(*r)
+            if synth_mode() {
+                // real noise: *Like ops produce random of the input tensor's shape
+                let shp = shape(ga(env, &n.input[0]));
+                if n.op == "RandomNormalLike" {
+                    let key = rng_key(1);
+                    let loc = n.af("mean", 0.0) as f32;
+                    let scale = n.af("scale", 1.0) as f32;
+                    one(op!(
+                        mlx_random_normal,
+                        shp.as_ptr(),
+                        shp.len(),
+                        F32,
+                        loc,
+                        scale,
+                        key
+                    ))
+                } else {
+                    let key = rng_key(2);
+                    let low = scalar_f32(n.af("low", 0.0) as f32);
+                    let high = scalar_f32(n.af("high", 1.0) as f32);
+                    one(op!(
+                        mlx_random_uniform,
+                        low,
+                        high,
+                        shp.as_ptr(),
+                        shp.len(),
+                        F32,
+                        key
+                    ))
+                }
+            } else {
+                let r = refmap
+                    .get(&n.output[0])
+                    .unwrap_or_else(|| panic!("RNG output not captured: {}", n.output[0]));
+                one(*r)
+            }
         }
 
         "Slice" => {

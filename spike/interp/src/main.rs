@@ -21,8 +21,19 @@ const F16: u32 = mlx_dtype__MLX_FLOAT16;
 static mut STREAM: mlx_stream = mlx_stream {
     ctx: std::ptr::null_mut(),
 };
+static mut SYNTH: bool = false;
 fn st() -> mlx_stream {
     unsafe { STREAM }
+}
+fn synth_mode() -> bool {
+    unsafe { SYNTH }
+}
+fn rng_key(seed: u64) -> mlx_array {
+    let mut r = newarr();
+    unsafe {
+        mlx_random_key(&mut r, seed);
+    }
+    r
 }
 fn newarr() -> mlx_array {
     unsafe { mlx_array_new() }
@@ -234,12 +245,104 @@ fn load_safetensors(path: &str) -> HashMap<String, mlx_array> {
     out
 }
 
-fn main() {
-    unsafe { STREAM = mlx_default_cpu_stream_new() };
-    let g: Graph = serde_json::from_reader(std::io::BufReader::new(
+fn load_graph() -> Graph {
+    serde_json::from_reader(std::io::BufReader::new(
         std::fs::File::open("spike/art/graph.json").unwrap(),
     ))
-    .unwrap();
+    .unwrap()
+}
+
+fn write_wav(path: &str, samples: &[f32], sr: u32) {
+    let data_bytes = samples.len() * 2;
+    let mut b: Vec<u8> = Vec::with_capacity(44 + data_bytes);
+    b.extend(b"RIFF");
+    b.extend(&((36 + data_bytes) as u32).to_le_bytes());
+    b.extend(b"WAVE");
+    b.extend(b"fmt ");
+    b.extend(&16u32.to_le_bytes());
+    b.extend(&1u16.to_le_bytes()); // PCM
+    b.extend(&1u16.to_le_bytes()); // mono
+    b.extend(&sr.to_le_bytes());
+    b.extend(&(sr * 2).to_le_bytes()); // byte rate
+    b.extend(&2u16.to_le_bytes()); // block align
+    b.extend(&16u16.to_le_bytes()); // bits/sample
+    b.extend(b"data");
+    b.extend(&(data_bytes as u32).to_le_bytes());
+    for &s in samples {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        b.extend(&v.to_le_bytes());
+    }
+    std::fs::write(path, b).unwrap();
+}
+
+/// Synthesis mode: IPA phonemes + voice -> WAV, via the MLX CPU interpreter.
+fn synth(ipa: &str, voice: &str, out: &str, speed: f32) {
+    let g = load_graph();
+    let weights = load_safetensors("spike/art/weights.safetensors");
+    let refmap: HashMap<String, mlx_array> = HashMap::new();
+    let mut env: Env = HashMap::new();
+    for (k, v) in &weights {
+        env.insert(k.clone(), Val::A(*v));
+    }
+
+    // tokenize IPA via assets/tokens.json {"vocab": {char: id}}
+    let tk: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open("assets/tokens.json").unwrap()).unwrap();
+    let vocab: HashMap<String, i64> = serde_json::from_value(tk["vocab"].clone()).unwrap();
+    let toks: Vec<i64> = ipa
+        .chars()
+        .filter_map(|c| vocab.get(&c.to_string()).copied())
+        .collect();
+    let n_tokens = toks.len();
+    let mut ids = vec![0i64];
+    ids.extend_from_slice(&toks);
+    ids.push(0);
+    let input_ids = from_i64(&ids, &[1, ids.len() as i32]);
+
+    // voice style row: voices/<name>.bin is row-major f32 [rows, 256]
+    let raw = std::fs::read(format!("assets/voices/{voice}.bin")).unwrap();
+    let vf: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let rows = vf.len() / 256;
+    let row = n_tokens.min(rows - 1);
+    let style = from_f32(&vf[row * 256..row * 256 + 256], &[1, 256]);
+    let speed_a = from_f32(&[speed], &[1]);
+
+    env.insert("input_ids".into(), Val::A(input_ids));
+    env.insert("style".into(), Val::A(style));
+    env.insert("speed".into(), Val::A(speed_a));
+
+    for n in &g.nodes {
+        let outs = run_node(n, &mut env, &refmap);
+        for (k, v) in outs {
+            env.insert(k, v);
+        }
+    }
+    let audio = match env.get("audio") {
+        Some(Val::A(a)) => read_f32(*a),
+        _ => panic!("no audio produced"),
+    };
+    write_wav(out, &audio, 24000);
+    println!(
+        "wrote {out}: {} samples ({:.2}s) from {} tokens (voice {voice}, speed {speed})",
+        audio.len(),
+        audio.len() as f32 / 24000.0,
+        n_tokens
+    );
+}
+
+fn main() {
+    unsafe { STREAM = mlx_default_cpu_stream_new() };
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s == "--synth").unwrap_or(false) {
+        unsafe { SYNTH = true };
+        let speed = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        synth(&args[2], &args[3], &args[4], speed);
+        return;
+    }
+    let g: Graph = load_graph();
     let weights = load_safetensors("spike/art/weights.safetensors");
     let refmap = load_safetensors("spike/art/ref.safetensors");
 
