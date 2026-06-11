@@ -1,6 +1,6 @@
 # Plan: replace the Swift MLX backend with an ONNX→MLX graph interpreter
 
-Status: **approved, Phase-0 spike in progress** · Last updated: 2026-06-10
+Status: **Phase-0 spike PASSED — GO** · Last updated: 2026-06-10
 
 ## TL;DR
 
@@ -161,14 +161,66 @@ becomes proven-correctness.
   library, so reimplement MLXNN." The interpreter **dissolves that blocker** —
   no nn library needed in any language, because the graph is pre-lowered.
 
+## Phase-0 spike results (PASSED)
+
+Run on an Apple M2 Max. Spike lives in `spike/` (gitignored); reproduce as below.
+
+**Outcome: GO.** Both highest-risk kernels reproduce ONNX Runtime CPU to float32
+epsilon, and Rust links mlx-c cleanly.
+
+| Check | Result |
+|---|---|
+| Build mlx-c + mlx core (CPU-only, `MLX_BUILD_METAL=OFF`) | ✅ `libmlxc.a` + `libmlx.a`, example runs |
+| ONNX Runtime CPU reference: 4756 intermediate tensors dumped for a fixed input | ✅ `spike/ref_tensors.npz` (audio rms 0.050) |
+| **Conv1d** parity (`/F0.0/conv1/Conv`, NCL↔NLC + weight `[Cout,Cin,K]→[Cout,K,Cin]`) | ✅ **rel 6.5e-7** |
+| **LSTM** parity (`/text_encoder/lstms.0`, bidirectional, hidden=256, `iofc` gate order) | ✅ **rel 2.7e-7** |
+| Rust → mlx-c link + compute (`mlx_add`, hand-declared externs) | ✅ verified |
+
+### Gotchas discovered (carry into Phase 1–2)
+- **Lazy transposes are strided views.** `mlx_array_data_float32` exposes the
+  underlying (pre-transpose) buffer, so a transposed result reads back wrong.
+  Call `mlx_contiguous(..., allow_col_major=false)` before reading raw data (or
+  before any step that assumes row-major memory). This was the entire initial
+  Conv mismatch.
+- **`mlx_dtype` enum: `MLX_FLOAT32 = 10`** (9 is `MLX_FLOAT16`). bindgen will get
+  this right; don't hand-hardcode.
+- **`mlx_array`/`mlx_stream` are single-`void*` structs** passed/returned by
+  value — maps to a `#[repr(C)]` one-pointer struct in Rust; the AArch64 ABI
+  handles it.
+- **Conv weight layout**: ONNX `[Cout,Cin,K]` → MLX `[Cout,K,Cin]` (transpose
+  axes `0,2,1`); input ONNX `[N,Cin,L]` → MLX `[N,L,Cin]`. MLX conv is
+  cross-correlation (matches ONNX), no kernel flip.
+- **LSTM**: ONNX gate order is **`iofc`**; per-direction `bias = Wb + Rb`;
+  backward direction processes timesteps reversed; `Y` is `[seq, num_dir, batch,
+  hidden]`. Confirmed exact.
+- **GPU build needs the Metal toolchain**: `xcodebuild -downloadComponent
+  MetalToolchain` (separate, on recent Xcode). CPU-only build skips it and is
+  sufficient for parity work; the production backend needs the GPU build.
+
+### Reproduce the spike
+```sh
+# build mlx-c CPU-only
+cp -R <mlx-c clone> spike/mlx-c && cd spike/mlx-c
+cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DMLX_BUILD_METAL=OFF
+cmake --build build -j
+# reference + per-op tensors
+export/.venv/bin/pip install onnxruntime
+export/.venv/bin/python spike/ref_dump.py          # -> spike/ref_tensors.npz
+# (extraction of conv/lstm tensors -> spike/td/*.bin; see git history of this work)
+# C parity harness:
+clang -O2 -Ispike/mlx-c spike/parity.c \
+  spike/mlx-c/build/libmlxc.a spike/mlx-c/build/_deps/mlx-build/libmlx.a \
+  -framework Accelerate -framework Foundation -lc++ -o spike/parity && ./spike/parity
+# Rust link test:
+cd spike/rust-link && cargo run --release
+```
+
 ## Phased plan
 
-- **Phase 0 — spike / go-no-go (in progress).** bindgen over mlx-c; build mlx-c +
-  core; load initializers as `mlx_array`; interpret a linear sub-slice of the
-  graph (text encoder: `Gemm`/`Conv`/`LayerNormalization`/`LSTM`) and **diff
-  against onnxruntime CPU** on the same `input_ids`. Kill-switch: if `LSTM`/`Conv`
-  parity is shaky here, stop. First concrete sub-step: pin the mlx-c/mlx build
-  (CMake vs prebuilt) and a minimal end-to-end "add two arrays from Rust" link.
+- **Phase 0 — spike / go-no-go. ✅ DONE — PASSED** (see "Phase-0 spike results").
+  Built mlx-c CPU-only, dumped the ONNX CPU reference, and proved Conv1d + the
+  bidirectional LSTM match to float32 epsilon, plus Rust↔mlx-c linkage. The
+  kill-switch (shaky LSTM/Conv parity) did not trigger.
 - **Phase 1 — op kernels.** Implement the ~15 non-trivial kernels, each unit-
   tested against numpy/onnxruntime reference on random inputs.
 - **Phase 2 — graph interpreter.** Topological executor + the bounded `Loop`/`If`/
