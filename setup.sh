@@ -84,11 +84,13 @@ ASSETS="$ROOT/assets"
 [ -f "$ASSETS/tokens.json" ] || die "export finished but $ASSETS/tokens.json is missing"
 voices=$(find "$ASSETS/voices" -name '*.bin' 2>/dev/null | wc -l | tr -d ' ')
 [ "$voices" -gt 0 ] || die "export finished but no voices were written"
+[ -f "$ASSETS/spk_encoder.onnx" ] || warn "spk_encoder.onnx missing (needed only for 'storytime clone')"
 
 log "Success — assets ready in $ASSETS:"
 printf '    kokoro.onnx  %s\n' "$(du -h "$ASSETS/kokoro.onnx" | cut -f1)"
 printf '    tokens.json\n'
 printf '    voices/      %s voice(s)\n' "$voices"
+[ -f "$ASSETS/spk_encoder.onnx" ] && printf '    spk_encoder.onnx  %s (voice cloning)\n' "$(du -h "$ASSETS/spk_encoder.onnx" | cut -f1)"
 echo
 log "Next: build the CLI (needs Rust — https://rustup.rs):"
 echo "    cd cli && cargo build --release            # ONNX backend"

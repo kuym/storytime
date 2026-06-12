@@ -45,6 +45,9 @@ plain float32 voice tensors that the Rust CLI consumes.
 - **Configurable output.** 16/24/32-bit PCM or IEEE float32, any sample rate
   (resampled from the model's native 24 kHz via a high-quality sinc resampler).
 - **Adjustable speaking rate** via `--speed`.
+- **Voice cloning.** `storytime clone` builds a new voicepack from a 10–20 s
+  recording of a real speaker via offline style-space optimization — see
+  [Voice cloning](#voice-cloning).
 
 ---
 
@@ -94,6 +97,7 @@ vendors nothing — `build.rs` fetches and builds mlx-c at build time.
    kokoro-v1_0.pth │   export.py   │→  kokoro.onnx                              │
    voices/*.pt    ─┼─▶  (kokoro +  │→  voices/*.bin  (float32, [N,1,256])      │
    config.json     │    PyTorch)   │→  tokens.json   (IPA char → token-id)     │
+   GE2E weights    │               │→  spk_encoder.onnx (voice-cloning scorer) │
                    └────────────────────────────────────────────────────────────┘
                                                 │
                                                 ▼
@@ -191,8 +195,9 @@ Either path writes:
 
 ```
 assets/
-├── kokoro.onnx      # ~325 MB, the full model
-├── tokens.json      # IPA char → token-id vocab
+├── kokoro.onnx       # ~325 MB, the full model
+├── tokens.json       # IPA char → token-id vocab
+├── spk_encoder.onnx  # ~6 MB GE2E speaker encoder (only used by `storytime clone`)
 └── voices/
     ├── af_alloy.bin
     ├── af_bella.bin
@@ -554,23 +559,99 @@ both the voice embedding and the G2P output that produced the IPA.
 
 ---
 
+## Voice cloning
+
+`storytime clone` creates a **new voicepack from a short recording of a real
+speaker** — record yourself once, then narrate any story in (an approximation
+of) your own voice, fully offline:
+
+```sh
+# 1. See the paragraph you'll need to read aloud.
+storytime clone --print-script
+
+# 2. Record yourself reading it (10–20 s, quiet room, any recorder), then
+#    convert to mono WAV:
+ffmpeg -i raw.m4a -ar 24000 -ac 1 ref.wav
+
+# 3. Optimize a new voicepack against the recording (hours; interruptible —
+#    audition mid-run and stop early, or extend later with --resume).
+storytime clone --ref ref.wav --name myvoice --budget-min 60
+
+# 4. Use it like any stock voice, forever, at zero extra runtime cost.
+echo "Once upon a time..." | storytime --voice myvoice -o story.wav
+```
+
+### How it works (and what to expect)
+
+Kokoro ships no reference/style encoder — hexgrad deliberately withheld it —
+so a recording cannot be *encoded* into the model's 256-dim style space.
+Instead, `clone` runs a gradient-free hill-climb over that space (after
+[KVoiceWalk](https://github.com/RobViren/kvoicewalk)): it starts from a blend
+of the stock voices closest to your recording, then repeatedly perturbs the
+style vector, synthesizes two fixed test utterances, and scores the audio
+against your recording — a weighted harmonic mean of **speaker-embedding
+similarity** (a GE2E encoder exported to `assets/spk_encoder.onnx`),
+**cross-text self-similarity** (stability), and a low-weight **acoustic
+feature** guard. Improvements are kept; the result is an ordinary
+`voices/<name>.bin`. Details in `docs/voice-cloning.md`.
+
+Set expectations accordingly: Kokoro is an 82 M-param model trained on a few
+hundred hours — the clone will be *recognizably you-ish*, not a studio-grade
+voice double. Results are stochastic; a different `--seed` can land a
+noticeably better (or worse) voice, and runs are cheap to repeat. Each step
+synthesizes one or two ~13 s test utterances, so expect on the order of
+0.2–0.5 steps/s depending on hardware and backend — the default `--steps 2000`
+is a multi-hour (typically overnight) walk, which is why `--budget-min`,
+mid-run auditioning, and `--resume` exist.
+
+### Practical knobs
+
+| flag | default | meaning |
+|---|---|---|
+| `--steps` | `2000` | maximum optimization steps |
+| `--budget-min` | `0` (off) | wall-clock cap in minutes; stops at whichever of `--steps`/budget hits first |
+| `--init` | auto | starting blend, e.g. `--init af_bella,af_heart`; default ranks all English voices against your recording and blends the top 3 |
+| `--seed` | `0` | RNG seed (best-effort reproducibility: CoreML/Metal inference is not bit-deterministic; use `--backend onnx` for stricter runs) |
+| `--resume` | | continue an interrupted walk from `voices/<name>.clone.json` |
+| `--ref-text FILE` | built-in script | transcript, if you recorded something other than `--print-script` (needs espeak-ng) |
+
+While a walk runs, the current best is checkpointed to `voices/<name>.bin`
+every 50 acceptances — you can **audition mid-run** from another terminal with
+`storytime --voice <name>` and stop early when it sounds right (re-run with
+`--resume` to continue). Recording tips: read the script naturally at your
+normal pitch, use a quiet room, and avoid clipping; clean input matters more
+than length. Cloning targets **English voices** (the speaker-similarity
+scorer is English-trained).
+
+One-time prerequisite: `assets/spk_encoder.onnx`, produced by `./setup.sh`
+(or `python export/export.py --skip-model --skip-voices` on an existing
+setup). espeak-ng is *not* needed at clone time — the test utterances ship
+pre-phonemized.
+
+---
+
 ## Repository layout
 
 ```
 storytime/
 ├── export/                  # one-shot Python export (not used at runtime)
 │   ├── export.py
+│   ├── verify_spk.py        # speaker-encoder parity checks (voice cloning)
 │   └── requirements.txt
 ├── cli/                     # Rust CLI (runtime)
 │   ├── Cargo.toml
 │   ├── build.rs             # fetches+builds mlx-c under --features mlx
 │   └── src/
 │       ├── main.rs
+│       ├── clone.rs         # `storytime clone` voice-cloning subcommand
+│       ├── dsp.rs           # audio analysis for cloning (spectrogram, YIN, ...)
+│       ├── script.rs        # screenplay / multi-voice mode
 │       └── mlx/             # MLX backend: native ONNX-graph interpreter
-├── docs/                    # ONNX->MLX design + verification notes
+├── docs/                    # design + verification notes
 ├── assets/                  # produced by export.py (gitignored)
 │   ├── kokoro.onnx
 │   ├── tokens.json
+│   ├── spk_encoder.onnx     # GE2E speaker encoder (voice cloning)
 │   └── voices/*.bin
 └── README.md
 ```
@@ -587,6 +668,10 @@ or use `--ipa` and provide phonemes from another source.
 
 **`could not locate assets/ directory`** — run `export.py` first, or pass
 `--assets /path/to/assets`.
+
+**`spk_encoder.onnx not found` (voice cloning)** — your `assets/` predates the
+cloning feature. Re-run `./setup.sh`, or on an existing setup:
+`cd export && source .venv/bin/activate && python export.py --skip-model --skip-voices`.
 
 **`Context leak detected, msgtracer returned -1`** — cosmetic noise from
 macOS's CoreML stack. Inference still runs correctly. Ignore.

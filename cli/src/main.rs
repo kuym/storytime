@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use ort::execution_providers::coreml::{
     CoreMLComputeUnits, CoreMLExecutionProvider, CoreMLModelFormat,
@@ -30,6 +30,8 @@ use ort::value::Tensor;
 #[cfg(feature = "mlx")]
 mod mlx;
 
+mod clone;
+mod dsp;
 mod script;
 
 // ort::Error doesn't implement std::error::Error; bridge via Display.
@@ -77,6 +79,22 @@ enum BitDepth {
                   stdin is treated as IPA phonemes directly (as espeak-ng -q --ipa=3 \
                   would emit), and espeak-ng is not required."
 )]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Cmd>,
+
+    #[command(flatten)]
+    synth: Args,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Create a new voicepack from a short reference recording of a speaker
+    /// (see README "Voice cloning").
+    Clone(clone::CloneArgs),
+}
+
+#[derive(clap::Args, Debug)]
 struct Args {
     /// Input text (or IPA with --ipa) file path. If omitted or `-`, read
     /// from stdin.
@@ -270,12 +288,12 @@ fn read_input(path: Option<&Path>) -> Result<String> {
 
 /// Resolve the CoreML compiled-model cache directory.
 /// Returns `Ok(None)` when caching is explicitly disabled.
-fn resolve_coreml_cache(args: &Args) -> Result<Option<PathBuf>> {
-    if args.no_coreml_cache {
+fn resolve_coreml_cache(no_cache: bool, explicit: Option<&Path>) -> Result<Option<PathBuf>> {
+    if no_cache {
         return Ok(None);
     }
-    if let Some(p) = args.coreml_cache.as_ref() {
-        return Ok(Some(p.clone()));
+    if let Some(p) = explicit {
+        return Ok(Some(p.to_path_buf()));
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let default = if cfg!(target_os = "macos") {
@@ -1478,27 +1496,86 @@ fn write_wav(path: &Path, samples: &[f32], sr: u32, depth: BitDepth) -> Result<(
     Ok(())
 }
 
-/// Run one chunk through the selected backend. Both backends take the same
-/// `(tokens, style, speed)` and return 24 kHz mono f32 samples.
-fn synth_chunk_dispatch(
+/// An initialized inference backend: an ONNX Runtime session (CoreML EP) or
+/// an MLX runtime. Both take the same `(tokens, style, speed)` and return
+/// 24 kHz mono f32 samples.
+struct Runtime {
     backend: Backend,
-    onnx_session: &mut Option<Session>,
-    tokens: &[i64],
-    style: Vec<f32>,
-    speed: f32,
-    #[cfg(feature = "mlx")] mlx_rt: &Option<mlx::MlxRuntime>,
-) -> Result<Vec<f32>> {
-    match backend {
-        Backend::Onnx => synthesize_chunk(onnx_session.as_mut().unwrap(), tokens, style, speed),
-        Backend::Mlx => {
-            #[cfg(feature = "mlx")]
-            {
-                mlx_rt.as_ref().unwrap().synthesize(tokens, &style, speed)
+    onnx_session: Option<Session>,
+    #[cfg(feature = "mlx")]
+    mlx_rt: Option<mlx::MlxRuntime>,
+}
+
+impl Runtime {
+    fn init(backend: Backend, assets: &Path, coreml_cache: Option<PathBuf>) -> Result<Self> {
+        #[cfg(feature = "mlx")]
+        let mut mlx_rt: Option<mlx::MlxRuntime> = None;
+        let onnx_session: Option<Session> = match backend {
+            Backend::Onnx => {
+                ort::init().with_name("storytime").commit().map_err(ort_err)?;
+                let mut coreml = CoreMLExecutionProvider::default()
+                    .with_model_format(CoreMLModelFormat::NeuralNetwork)
+                    .with_compute_units(CoreMLComputeUnits::All)
+                    .with_low_precision_accumulation_on_gpu(true);
+                if let Some(dir) = coreml_cache.as_ref() {
+                    fs::create_dir_all(dir)?;
+                    coreml = coreml.with_model_cache_dir(dir.display().to_string());
+                    eprintln!("storytime: backend=onnx, coreml cache: {}", dir.display());
+                } else {
+                    eprintln!("storytime: backend=onnx, coreml cache disabled");
+                }
+                Some(
+                    Session::builder()
+                        .map_err(ort_err)?
+                        .with_optimization_level(GraphOptimizationLevel::Level3)
+                        .map_err(ort_err)?
+                        .with_execution_providers([coreml.build()])
+                        .map_err(ort_err)?
+                        .commit_from_file(assets.join("kokoro.onnx"))
+                        .map_err(ort_err)?,
+                )
             }
-            #[cfg(not(feature = "mlx"))]
-            {
-                let _ = (tokens, style, speed);
-                bail!("MLX backend not compiled in")
+            Backend::Mlx => {
+                #[cfg(not(feature = "mlx"))]
+                bail!("MLX backend not compiled in. Rebuild with: cargo build --features mlx");
+
+                #[cfg(feature = "mlx")]
+                {
+                    let device = if mlx::gpu_available() {
+                        mlx::Device::Gpu
+                    } else {
+                        mlx::Device::Cpu
+                    };
+                    eprintln!("storytime: backend=mlx, device={:?}", device);
+                    mlx_rt = Some(mlx::MlxRuntime::new(&assets.join("kokoro.onnx"), device)?);
+                    None
+                }
+            }
+        };
+        Ok(Runtime {
+            backend,
+            onnx_session,
+            #[cfg(feature = "mlx")]
+            mlx_rt,
+        })
+    }
+
+    /// Run one chunk through the selected backend.
+    fn synth(&mut self, tokens: &[i64], style: Vec<f32>, speed: f32) -> Result<Vec<f32>> {
+        match self.backend {
+            Backend::Onnx => {
+                synthesize_chunk(self.onnx_session.as_mut().unwrap(), tokens, style, speed)
+            }
+            Backend::Mlx => {
+                #[cfg(feature = "mlx")]
+                {
+                    self.mlx_rt.as_ref().unwrap().synthesize(tokens, &style, speed)
+                }
+                #[cfg(not(feature = "mlx"))]
+                {
+                    let _ = (tokens, style, speed);
+                    bail!("MLX backend not compiled in")
+                }
             }
         }
     }
@@ -1514,9 +1591,7 @@ fn synthesize_voice_chunks(
     voice: &Voice,
     vocab: &HashMap<String, i64>,
     max_tokens: usize,
-    backend: Backend,
-    onnx_session: &mut Option<Session>,
-    #[cfg(feature = "mlx")] mlx_rt: &Option<mlx::MlxRuntime>,
+    rt: &mut Runtime,
     speed: f32,
     trim_threshold: f32,
     fade: usize,
@@ -1534,15 +1609,7 @@ fn synthesize_voice_chunks(
             continue;
         }
         let style = select_style(voice, tokens.len());
-        let audio = synth_chunk_dispatch(
-            backend,
-            onnx_session,
-            &tokens,
-            style,
-            speed,
-            #[cfg(feature = "mlx")]
-            mlx_rt,
-        )?;
+        let audio = rt.synth(&tokens, style, speed)?;
         let mut buf = trim_silence(&audio, trim_threshold).to_vec();
         apply_fade(&mut buf, fade);
         bufs.push(buf);
@@ -1630,15 +1697,12 @@ fn mix_timeline(turns: &[TurnAudio], line_gap: usize, overlap: usize, duck_gain:
 /// Screenplay mode: parse the script, resolve each character to a voice,
 /// synthesize every speech in its voice, and mix the timeline (with overlapping
 /// interruptions). Reuses the same per-text synthesis path as single-voice mode.
-#[allow(clippy::too_many_arguments)]
 fn run_script(
     args: &Args,
     assets: &Path,
     raw_input: &str,
     vocab: &HashMap<String, i64>,
-    backend: Backend,
-    onnx_session: &mut Option<Session>,
-    #[cfg(feature = "mlx")] mlx_rt: &Option<mlx::MlxRuntime>,
+    rt: &mut Runtime,
     fade: usize,
 ) -> Result<()> {
     // 1. Parse the script (with an optional separate --cast file).
@@ -1740,10 +1804,7 @@ fn run_script(
             voice,
             vocab,
             max_tokens,
-            backend,
-            onnx_session,
-            #[cfg(feature = "mlx")]
-            mlx_rt,
+            rt,
             args.speed,
             args.trim_threshold,
             fade,
@@ -1783,7 +1844,11 @@ fn run_script(
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
+    if let Some(Cmd::Clone(clone_args)) = cli.command {
+        return clone::run(clone_args);
+    }
+    let args = cli.synth;
 
     let assets = assets_dir(args.assets.as_deref())?;
 
@@ -1811,51 +1876,8 @@ fn main() -> Result<()> {
     });
 
     // Initialize the chosen inference backend (shared by both paths).
-    #[cfg(feature = "mlx")]
-    let mut mlx_rt: Option<mlx::MlxRuntime> = None;
-    let mut onnx_session: Option<Session> = match backend {
-        Backend::Onnx => {
-            ort::init().with_name("storytime").commit().map_err(ort_err)?;
-            let cache_dir = resolve_coreml_cache(&args)?;
-            let mut coreml = CoreMLExecutionProvider::default()
-                .with_model_format(CoreMLModelFormat::NeuralNetwork)
-                .with_compute_units(CoreMLComputeUnits::All)
-                .with_low_precision_accumulation_on_gpu(true);
-            if let Some(dir) = cache_dir.as_ref() {
-                fs::create_dir_all(dir)?;
-                coreml = coreml.with_model_cache_dir(dir.display().to_string());
-                eprintln!("storytime: backend=onnx, coreml cache: {}", dir.display());
-            } else {
-                eprintln!("storytime: backend=onnx, coreml cache disabled");
-            }
-            Some(
-                Session::builder()
-                    .map_err(ort_err)?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)
-                    .map_err(ort_err)?
-                    .with_execution_providers([coreml.build()])
-                    .map_err(ort_err)?
-                    .commit_from_file(assets.join("kokoro.onnx"))
-                    .map_err(ort_err)?,
-            )
-        }
-        Backend::Mlx => {
-            #[cfg(not(feature = "mlx"))]
-            bail!("MLX backend not compiled in. Rebuild with: cargo build --features mlx");
-
-            #[cfg(feature = "mlx")]
-            {
-                let device = if mlx::gpu_available() {
-                    mlx::Device::Gpu
-                } else {
-                    mlx::Device::Cpu
-                };
-                eprintln!("storytime: backend=mlx, device={:?}", device);
-                mlx_rt = Some(mlx::MlxRuntime::new(&assets.join("kokoro.onnx"), device)?);
-                None
-            }
-        }
-    };
+    let cache_dir = resolve_coreml_cache(args.no_coreml_cache, args.coreml_cache.as_deref())?;
+    let mut rt = Runtime::init(backend, &assets, cache_dir)?;
 
     let fade = (NATIVE_SR as usize * args.fade_ms as usize) / 1000;
 
@@ -1863,17 +1885,7 @@ fn main() -> Result<()> {
     // resolve voices, synthesize per character, and mix (with overlapping
     // interruptions). It shares the per-text synthesis path below.
     if args.script {
-        return run_script(
-            &args,
-            &assets,
-            &raw_input,
-            &vocab,
-            backend,
-            &mut onnx_session,
-            #[cfg(feature = "mlx")]
-            &mlx_rt,
-            fade,
-        );
+        return run_script(&args, &assets, &raw_input, &vocab, &mut rt, fade);
     }
 
     // ---- Single-voice path ----
@@ -1988,10 +2000,7 @@ fn main() -> Result<()> {
             &voice,
             &vocab,
             max_tokens,
-            backend,
-            &mut onnx_session,
-            #[cfg(feature = "mlx")]
-            &mlx_rt,
+            &mut rt,
             args.speed,
             args.trim_threshold,
             fade,
@@ -2392,6 +2401,40 @@ mod tests {
         assert!(promoted.contains('ˈ') && !promoted.contains('ˌ'));
         // None level is a no-op.
         assert_eq!(apply_emphasis_to_ipa("bˈuː", Emph::None), "bˈuː");
+    }
+
+    #[test]
+    fn legacy_flag_invocation_parses_without_subcommand() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "storytime", "--voice", "af_bella", "--speed", "1.1", "-o", "/tmp/x.wav",
+        ])
+        .expect("legacy invocation must keep parsing");
+        assert!(cli.command.is_none());
+        assert_eq!(cli.synth.voice, "af_bella");
+        assert_eq!(cli.synth.output.as_deref(), Some(Path::new("/tmp/x.wav")));
+    }
+
+    #[test]
+    fn clone_subcommand_parses() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from([
+            "storytime", "clone", "--ref", "/tmp/me.wav", "--name", "kuy",
+            "--init", "af_bella,af_heart", "--steps", "100",
+        ])
+        .expect("clone invocation must parse");
+        match cli.command {
+            Some(Cmd::Clone(c)) => {
+                assert_eq!(c.name.as_deref(), Some("kuy"));
+                assert_eq!(c.init, vec!["af_bella", "af_heart"]);
+                assert_eq!(c.steps, 100);
+            }
+            other => panic!("expected clone subcommand, got {other:?}"),
+        }
+        // --print-script needs neither --ref nor --name.
+        assert!(Cli::try_parse_from(["storytime", "clone", "--print-script"]).is_ok());
+        // Without --print-script, --ref and --name are required.
+        assert!(Cli::try_parse_from(["storytime", "clone"]).is_err());
     }
 
     #[test]

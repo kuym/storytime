@@ -18,7 +18,7 @@ All Rust work happens in `cli/` (it is its own crate, **not** a workspace — th
 ```sh
 cd cli
 cargo build --release            # binary: cli/target/release/storytime
-cargo test                       # unit tests live at the bottom of src/main.rs
+cargo test                       # unit tests (bottom of main.rs, clone.rs, dsp.rs)
 cargo test parse_emphasis        # run a single test by name substring
 cargo clippy
 
@@ -32,7 +32,8 @@ One-time model export (regenerates the gitignored `assets/`):
 cd export
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python export.py                 # writes assets/{kokoro.onnx, tokens.json, voices/*.bin}
+python export.py                 # writes assets/{kokoro.onnx, tokens.json, voices/*.bin,
+                                 #                spk_encoder.onnx}
 ```
 
 Quick manual run:
@@ -100,6 +101,20 @@ CPU≡GPU check) is in `docs/onnx-to-mlx-plan.md`; the standalone parity/`--comp
 unsupported fallback), pure FFI with no third-party audio crates. When editing one variant, update the
 others so every `cfg` configuration still compiles.
 
+## Voice cloning (`storytime clone`)
+
+`cli/src/clone.rs` implements a KVoiceWalk-style gradient-free hill climb over the 256-d style
+space (Kokoro's style encoder was never released, so cloning is search, not encoding): blend of
+stock voices → perturb a shared per-dim delta → synthesize two baked test utterances via the normal
+`Runtime` → score vs the reference recording (GE2E speaker similarity + cross-text self-similarity
++ acoustic features, weighted harmonic mean) → write an ordinary `voices/<name>.bin`.
+`cli/src/dsp.rs` holds the analysis DSP: WAV reading, a librosa-parity power spectrogram
+(fixture-tested), YIN F0, and the `SpeakerEncoder` over `assets/spk_encoder.onnx` (exported by
+`export.py`; parity gated by `export/verify_spk.py` and the `#[ignore]`d `spk_embedding_*` test).
+The test-utterance IPA is baked into constants — regenerate with
+`cargo test regenerate_baked_ipa -- --ignored --nocapture` after editing the texts. Design and
+deliberate deviations from upstream KVoiceWalk are in `docs/voice-cloning.md`.
+
 ## Conventions
 
 - **Voice tensors** are raw little-endian f32 of shape `[N,1,256]` where N is 510 or 511; the loader
@@ -108,4 +123,7 @@ others so every `cfg` configuration still compiles.
 - **Model is native 24 kHz**; any other `--sample-rate` is reached via the `rubato` sinc resampler.
 - `assets/` and `*.wav` are gitignored and large; never commit them. Stray `bedtime-story-*.wav/.txt`
   and `demo/*.txt` files in the repo root are scratch output, not source.
-- Unit tests are colocated in the `#[cfg(test)] mod tests` block at the end of `main.rs`.
+- Unit tests are colocated in a `#[cfg(test)] mod tests` block at the end of each module
+  (`main.rs`, `clone.rs`, `dsp.rs`, `script.rs`). Two `#[ignore]`d tests need extra setup:
+  `spk_embedding_matches_python_frontend` (embedding parity, see its doc comment) and
+  `regenerate_baked_ipa` (espeak-ng).

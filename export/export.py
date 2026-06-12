@@ -9,6 +9,7 @@ Pipeline:
   kokoro-v1_0.pth  ->  kokoro.onnx
   voices/*.pt      ->  voices/*.bin   (float32, shape [511, 1, 256], C-order)
   config.json vocab ->  tokens.json   (char -> token-id map the CLI tokenizes with)
+  GE2E pretrained.pt -> spk_encoder.onnx  (speaker encoder for `storytime clone`)
 """
 from __future__ import annotations
 
@@ -129,6 +130,99 @@ def export_voices(snapshot: Path, out_dir: Path) -> int:
     return count
 
 
+# Resemblyzer's GE2E speaker encoder (resemble-ai/Resemblyzer, Apache-2.0).
+# `storytime clone` scores candidate voices by cosine similarity of these
+# embeddings. The weights file is fetched directly (pinned commit) instead of
+# pip-installing resemblyzer, whose webrtcvad dependency often fails to build.
+GE2E_URL = (
+    "https://raw.githubusercontent.com/resemble-ai/Resemblyzer/"
+    "eca320dbbb89a82d9d8927ddad8bc140763f48e9/resemblyzer/pretrained.pt"
+)
+
+# Resemblyzer's audio frontend constants (16 kHz, 25 ms window, 10 ms hop).
+SPK_SR = 16_000
+SPK_N_FFT = 400
+SPK_N_MELS = 40
+
+
+class GE2EWrapper(nn.Module):
+    """GE2E encoder with the mel filterbank baked into the graph.
+
+    Input is the *power* spectrogram [batch, frames, 201] (n_fft=400, hop=160,
+    periodic hann, centered with zero padding, |STFT|^2 — resemblyzer feeds the
+    mel power spectrogram to the LSTM with no log). Baking the librosa Slaney
+    filterbank in as a constant means the Rust side only has to reproduce a
+    windowed rFFT, which is trivially unit-testable.
+    """
+
+    def __init__(self, state_dict: dict, mel_fb: np.ndarray):
+        super().__init__()
+        self.lstm = nn.LSTM(SPK_N_MELS, 256, num_layers=3, batch_first=True)
+        self.linear = nn.Linear(256, 256)
+        self.load_state_dict(state_dict, strict=False)
+        # [201, 40] so forward is a plain matmul on [B, T, 201].
+        self.register_buffer("mel_fb_t", torch.from_numpy(mel_fb.T.copy()).float())
+
+    def forward(self, power_spec: torch.Tensor) -> torch.Tensor:
+        mels = torch.matmul(power_spec, self.mel_fb_t)
+        _, (hidden, _) = self.lstm(mels)
+        raw = torch.relu(self.linear(hidden[-1]))
+        return raw / torch.norm(raw, dim=1, keepdim=True).clamp(min=1e-12)
+
+
+def fetch_ge2e_weights() -> Path:
+    import urllib.request
+
+    cache = Path(__file__).resolve().parent / ".cache"
+    cache.mkdir(exist_ok=True)
+    dest = cache / "ge2e_pretrained_eca320d.pt"
+    if not dest.exists():
+        print(f"downloading GE2E weights from {GE2E_URL} ...", file=sys.stderr)
+        urllib.request.urlretrieve(GE2E_URL, dest)
+    return dest
+
+
+def export_speaker_encoder(out_dir: Path, opset: int) -> Path:
+    try:
+        import librosa
+    except ImportError:
+        sys.exit("librosa is required for the speaker-encoder export: pip install librosa")
+
+    ckpt = torch.load(fetch_ge2e_weights(), map_location="cpu", weights_only=True)
+    state = ckpt.get("model_state", ckpt)
+    state = {k: v for k, v in state.items() if k.startswith(("lstm.", "linear."))}
+
+    mel_fb = librosa.filters.mel(
+        sr=SPK_SR, n_fft=SPK_N_FFT, n_mels=SPK_N_MELS
+    )  # [40, 201], Slaney scale + normalization (librosa defaults)
+    wrapper = GE2EWrapper(state, mel_fb).eval()
+
+    onnx_path = out_dir / "spk_encoder.onnx"
+    dummy = torch.randn(2, 160, SPK_N_FFT // 2 + 1).abs()
+    print(f"exporting speaker encoder to {onnx_path} (opset {opset}) ...", file=sys.stderr)
+    with torch.no_grad():
+        out = wrapper(dummy)
+        assert out.shape == (2, 256), f"unexpected embedding shape {out.shape}"
+        norms = out.norm(dim=1)
+        assert torch.allclose(norms, torch.ones(2), atol=1e-4), "embeddings not L2-normed"
+        torch.onnx.export(
+            wrapper,
+            (dummy,),
+            str(onnx_path),
+            input_names=["power_spec"],
+            output_names=["embedding"],
+            dynamic_axes={"power_spec": {0: "batch", 1: "frames"}},
+            opset_version=opset,
+            do_constant_folding=True,
+            dynamo=False,
+        )
+
+    import onnx
+    onnx.checker.check_model(str(onnx_path))
+    print(f"  ok: {onnx_path.stat().st_size / 1e6:.1f} MB", file=sys.stderr)
+    return onnx_path
+
+
 def export_tokens(snapshot: Path, out_dir: Path) -> None:
     cfg = json.loads((snapshot / "config.json").read_text())
     vocab = cfg["vocab"]
@@ -156,6 +250,8 @@ def main() -> None:
     ap.add_argument("--opset", type=int, default=17)
     ap.add_argument("--skip-model", action="store_true")
     ap.add_argument("--skip-voices", action="store_true")
+    ap.add_argument("--skip-spk", action="store_true",
+                    help="skip the speaker-encoder export (only needed for `storytime clone`)")
     args = ap.parse_args()
 
     if args.snapshot is None:
@@ -171,6 +267,8 @@ def main() -> None:
     export_tokens(snapshot, args.out)
     if not args.skip_voices:
         export_voices(snapshot, args.out)
+    if not args.skip_spk:
+        export_speaker_encoder(args.out, args.opset)
     print("done.", file=sys.stderr)
 
 

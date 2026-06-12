@@ -1061,6 +1061,7 @@ dependencies = [
  "ndarray",
  "ort",
  "prost",
+ "realfft",
  "rubato",
  "serde",
  "serde_json",
