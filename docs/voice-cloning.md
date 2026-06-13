@@ -164,7 +164,15 @@ before the first step and once at exit. The time trigger matters because a CPU r
 that a step-only cadence could miss a short session; with it, a 5-minute run always leaves a
 recent, resumable checkpoint regardless of backend speed. On completion, `finalize()` renames
 `<name>.bin.temp` → `<name>.bin` and deletes the sidecar; a non-completing stop (`--budget-min`,
-kill) leaves the temps in place.
+Ctrl-C, kill) leaves the temps in place.
+
+**Ctrl-C / SIGTERM** is handled explicitly (the `interrupt` module): `run()` installs a handler at
+startup that flips an atomic flag the walk polls, so the first interrupt finishes the current step,
+writes a checkpoint, and exits 0 via the same "paused" path as `--budget-min`; a second interrupt
+hard-exits (130). Installing our own handler also *reclaims* SIGINT when the process inherited it as
+ignored — a background shell job sets `SIGINT` to `SIG_IGN` and children inherit it, which otherwise
+silently swallows Ctrl-C. The handler is async-signal-safe (atomic store / `_exit` only) and uses
+raw libc FFI, no new crate.
 
 `--resume` reads the sidecar and continues toward the original `--steps` (seed re-derived as
 `seed + step` so it doesn't replay the same perturbations). Preview resolution: a bare `--voice

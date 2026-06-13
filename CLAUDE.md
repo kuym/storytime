@@ -120,7 +120,9 @@ sidecar, both rewritten atomically every ~50 steps or 60 s; the final `<name>.bi
 on completion (`finalize` renames the temp into place, removes the sidecar). `--resume` continues
 from the sidecar; `--budget-min`/kill leave the temps. The inference loader (`resolve_voice_path` in
 `main.rs`) makes `--voice <name>` fall back to `<name>.bin.temp`, so a partial voice previews under
-its eventual name while a second `storytime` keeps training.
+its eventual name while a second `storytime` keeps training. The `interrupt` module installs a
+SIGINT/SIGTERM handler (raw libc FFI) so Ctrl-C stops the walk gracefully with a checkpoint — and
+reclaims SIGINT if it was inherited as `SIG_IGN`; a second Ctrl-C hard-exits.
 `cli/src/dsp.rs` holds the analysis DSP: WAV reading, a librosa-parity power spectrogram
 (fixture-tested), YIN F0, and the `SpeakerEncoder` over `assets/spk_encoder.onnx` (exported by
 `export.py`; parity gated by `export/verify_spk.py` and the `#[ignore]`d `spk_embedding_*` tests).

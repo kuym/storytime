@@ -57,6 +57,51 @@ const AUTO_INIT_TOP: usize = 3;
 const CHECKPOINT_EVERY_STEPS: u32 = 50;
 const CHECKPOINT_EVERY_SECS: u64 = 60;
 
+/// Ctrl-C / SIGTERM handling for the long training loop.
+///
+/// We install our own handler (rather than relying on the default terminate)
+/// for two reasons: a first interrupt should stop *gracefully* — finish the
+/// current step, write a checkpoint, and leave a resumable `.bin.temp` — and
+/// installing a handler also reclaims the signal if the process was launched
+/// with SIGINT ignored (a background shell job sets SIGINT to SIG_IGN and the
+/// child inherits it, which silently swallows Ctrl-C). A second interrupt means
+/// the user is impatient, so we hard-exit immediately.
+mod interrupt {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+        fn _exit(code: i32) -> !;
+    }
+
+    extern "C" fn on_signal(_sig: i32) {
+        // Async-signal-safe: flip a flag the walk polls. A second signal (flag
+        // already set) bypasses the graceful path and exits now.
+        if REQUESTED.swap(true, Ordering::SeqCst) {
+            unsafe { _exit(130) };
+        }
+    }
+
+    /// Take over SIGINT and SIGTERM. Idempotent; safe to call once at startup.
+    pub fn install() {
+        let handler = on_signal as *const () as usize;
+        unsafe {
+            signal(SIGINT, handler);
+            signal(SIGTERM, handler);
+        }
+    }
+
+    /// True once the user has asked to stop (Ctrl-C / SIGTERM).
+    pub fn requested() -> bool {
+        REQUESTED.load(Ordering::Relaxed)
+    }
+}
+
 /// The paragraph the user records themselves reading (`--print-script`).
 /// Its IPA is baked below (`TARGET_IPA`) so espeak-ng is not needed at clone
 /// time and the speaker-embedding comparison is text-matched.
@@ -383,6 +428,10 @@ pub fn run(args: CloneArgs) -> Result<()> {
         println!("{REFERENCE_SCRIPT}");
         return Ok(());
     }
+    // Reclaim Ctrl-C/SIGTERM up front so they stop the run gracefully (and work
+    // even if launched with SIGINT inherited-ignored).
+    interrupt::install();
+
     let name = args.name.as_deref().expect("clap enforces --name");
     let ref_path = args.reference.as_deref().expect("clap enforces --ref");
     if name.contains(['/', '\\']) || name.is_empty() {
@@ -577,6 +626,10 @@ pub fn run(args: CloneArgs) -> Result<()> {
     let mut last_checkpoint = Instant::now();
     let mut candidate = vec![0f32; STYLE_DIM];
     while step < args.steps {
+        if interrupt::requested() {
+            eprintln!("clone: interrupt received — stopping after step {step} (Ctrl-C again to abort)");
+            break;
+        }
         if budget > 0 && started.elapsed().as_secs() >= budget {
             eprintln!("clone: budget reached after {step} steps");
             break;
@@ -691,6 +744,12 @@ fn rank_voices(
     let mut ranked: Vec<(String, f32)> = Vec::new();
     eprintln!("clone: ranking stock voices against the reference ...");
     for (name, voice) in stock {
+        // Honor Ctrl-C during the (bounded but ~30 s) ranking sweep, once we
+        // have at least one ranked voice to blend from.
+        if interrupt::requested() && !ranked.is_empty() {
+            eprintln!("clone: interrupt received — ranking with {} voice(s) so far", ranked.len());
+            break;
+        }
         if !name.starts_with('a') && !name.starts_with('b') {
             continue;
         }

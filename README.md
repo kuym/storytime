@@ -633,8 +633,9 @@ training completes** (the temp file is then renamed into place and the sidecar
 removed). So you can:
 
 ```sh
-# Start training, then stop it any time (Ctrl-C, kill, reboot) — it loses at
-# most the last interval.
+# Start training. Press Ctrl-C any time to stop gracefully: it finishes the
+# current step, writes a checkpoint, and exits (press Ctrl-C again to abort
+# immediately). A kill/reboot loses at most the last checkpoint interval.
 storytime clone --ref ref.wav --name myvoice --steps 2000
 
 # Resume from exactly where it left off (continues toward the original --steps):
