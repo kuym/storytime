@@ -530,6 +530,7 @@ leaving the body as pure dialogue. `--script` is incompatible with `--ipa`.
 | `--speed FLOAT` | `1.0` | speaking rate multiplier |
 | `--pitch SEMITONES` | `0` | pitch shift in semitones (+ up / − down), tempo preserved; script-mode default (see below) |
 | `--ipa` | off | treat stdin as IPA (skip espeak-ng) |
+| `--espeak-voice CODE` | *(auto)* | force the espeak-ng voice for phonemization (e.g. `en-gb`); by default chosen per voice from its language prefix |
 | `--assets PATH` | `../assets` | location of exported assets |
 | `--list-voices` | — | list available voices and exit |
 | `-o, --output PATH` | *(unset)* | write WAV here; `-` streams WAV to stdout; if omitted, play to default output device |
@@ -567,6 +568,16 @@ Naming convention: `{lang}{gender}_{name}`.
 
 Match your voice to your input language — pronunciation quality depends on
 both the voice embedding and the G2P output that produced the IPA.
+
+storytime selects the **espeak-ng voice automatically from each voice's
+language prefix**, so the phonemes match the accent: American voices (`a*`) use
+`en-us`, British voices (`b*`) use `en-gb` (which gives the non-rhotic vowels
+and trap-bath split British voices were trained on), and the non-English
+prefixes map to their respective espeak languages. This is per-voice, so in
+`--script` mode a British character and an American one are phonemized
+differently in the same run. Pass `--espeak-voice CODE` to force a specific
+espeak voice for everything (e.g. an accent the prefix can't express, or a
+cloned voice whose name carries no language prefix).
 
 ---
 

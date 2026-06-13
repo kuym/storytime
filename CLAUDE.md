@@ -66,7 +66,11 @@ because each stage assumes the previous one's invariants:
    each block on `PRESERVED_PUNCT` boundaries, feeds only text segments to one espeak invocation, and
    **interleaves the punctuation back** into the IPA. It also **consumes the emphasis sentinels** here,
    converting them to IPA stress via `apply_emphasis_to_ipa`/`emphasize_word` (lengthen the
-   primary-stressed vowel with `ː`). Sentinels never reach espeak or the model.
+   primary-stressed vowel with `ː`). Sentinels never reach espeak or the model. The espeak `-v` voice
+   is chosen per storytime voice by `espeak_voice_for` (from the `{lang}{gender}_` prefix: `a*`→`en-us`,
+   `b*`→`en-gb`, …) so each accent is phonemized correctly — `--espeak-voice` overrides it. This is
+   resolved at each call site (single-voice path, and **per character** in `--script` mode), so it must
+   be threaded wherever synthesis happens.
 5. **`chunk_ipa`** — the model's style tensor caps at ~510 tokens. Long IPA is split at sentence
    (`.!?;…`) → word → char boundaries (`split_long_sentence`/`hard_split`) so no chunk exceeds the cap.
 6. **`tokenize`** → **synthesis** (`synthesize_chunk` for ONNX; `mlx::MlxRuntime::synthesize` for MLX —

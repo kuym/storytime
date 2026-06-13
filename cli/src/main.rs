@@ -128,6 +128,13 @@ struct Args {
     #[arg(long)]
     ipa: bool,
 
+    /// Override the espeak-ng voice (`-v`) used for grapheme→IPA conversion,
+    /// e.g. `en-gb`. By default it is chosen automatically from the storytime
+    /// voice's language prefix (American voices → `en-us`, British → `en-gb`,
+    /// etc.). In --script mode this overrides the per-character choice for all.
+    #[arg(long)]
+    espeak_voice: Option<String>,
+
     /// Disable markdown preprocessing. By default markdown formatting is
     /// interpreted: bold (`**`/`__`) becomes emphasized speech, italic
     /// (`*`/`_`) becomes stressed speech, and other markers (headings aside)
@@ -990,7 +997,35 @@ fn apply_emphasis_to_ipa(ipa: &str, level: Emph) -> String {
         .join(" ")
 }
 
+/// The espeak-ng voice (`-v`) for a storytime voice, from its `{lang}{gender}_`
+/// prefix: `af_bella` → American English, `bm_george` → British English, etc.
+/// This matters because espeak-ng phonemizes, say, British vowels differently
+/// from American (non-rhotic, different `a`/`o` qualities); feeding a `b*` voice
+/// `en-us` IPA mangles its accent. Names that don't follow the convention
+/// (e.g. cloned voices) fall through to the default English.
+fn espeak_voice_for(voice_name: &str) -> &'static str {
+    let b = voice_name.as_bytes();
+    if b.len() >= 3 && b[2] == b'_' {
+        match b[0] {
+            b'a' => return "en-us",  // American English
+            b'b' => return "en-gb",  // British English
+            b'e' => return "es",     // Spanish
+            b'f' => return "fr-fr",  // French
+            b'h' => return "hi",     // Hindi
+            b'i' => return "it",     // Italian
+            b'j' => return "ja",     // Japanese
+            b'p' => return "pt-br",  // Brazilian Portuguese
+            b'z' => return "cmn",    // Mandarin Chinese
+            _ => {}
+        }
+    }
+    "en-us"
+}
+
 /// Run espeak-ng for grapheme->IPA conversion, preserving punctuation.
+///
+/// `espeak_voice` is the espeak-ng voice id (`-v`, e.g. `en-us` / `en-gb`),
+/// chosen per storytime voice so each accent is phonemized correctly.
 ///
 /// The strategy is: split the input on every preserved punctuation
 /// character, send only the text segments to espeak-ng (one per line),
@@ -998,7 +1033,7 @@ fn apply_emphasis_to_ipa(ipa: &str, level: Emph) -> String {
 /// back into the output. One espeak invocation per call, same as a
 /// naive pass-through — but the resulting IPA contains `?`, `:`, `;`,
 /// etc., which espeak would otherwise drop.
-fn run_espeak(text: &str) -> Result<String> {
+fn run_espeak(text: &str, espeak_voice: &str) -> Result<String> {
     #[derive(Debug)]
     enum Piece<'a> {
         Text(&'a str, Emph),
@@ -1067,7 +1102,7 @@ fn run_espeak(text: &str) -> Result<String> {
             .collect::<Vec<_>>()
             .join("\n");
         let mut child = Command::new("espeak-ng")
-            .args(["-q", "--ipa=3", "-v", "en-us"])
+            .args(["-q", "--ipa=3", "-v", espeak_voice])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1654,13 +1689,14 @@ fn synthesize_voice_chunks(
     rt: &mut Runtime,
     speed: f32,
     pitch_semitones: f32,
+    espeak_voice: &str,
     trim_threshold: f32,
     fade: usize,
 ) -> Result<Vec<Vec<f32>>> {
     let ipa = if is_ipa {
         text.to_string()
     } else {
-        run_espeak(text)?
+        run_espeak(text, espeak_voice)?
     };
     let chunks = chunk_ipa(&ipa, vocab, max_tokens);
 
@@ -1825,7 +1861,9 @@ fn run_script(
     for s in &speakers {
         let p = pitch_for(s);
         let pstr = if p != 0.0 { format!(", pitch {p:+}") } else { String::new() };
-        eprintln!("storytime:   {s} -> {}{pstr}", mapping.get(s).map_or("?", |v| v));
+        let vid = mapping.get(s).map_or("?", |v| v);
+        let ev = args.espeak_voice.as_deref().unwrap_or_else(|| espeak_voice_for(vid));
+        eprintln!("storytime:   {s} -> {vid}{pstr} (espeak {ev})");
     }
 
     // 3. Load each distinct voice once. The style cap is the smallest across
@@ -1884,6 +1922,13 @@ fn run_script(
     let mut turns_audio: Vec<TurnAudio> = Vec::new();
     for (idx, turn) in turns.iter().enumerate() {
         let voice = &voices[&turn.voice_id];
+        // Per-character espeak voice: an explicit --espeak-voice overrides all,
+        // else derive it from this character's resolved voice (so a British
+        // character is phonemized en-gb even mid-script).
+        let espeak_voice = args
+            .espeak_voice
+            .as_deref()
+            .unwrap_or_else(|| espeak_voice_for(&turn.voice_id));
         let text = if args.no_markdown {
             turn.text.clone()
         } else {
@@ -1899,6 +1944,7 @@ fn run_script(
             rt,
             args.speed,
             turn.pitch,
+            espeak_voice,
             args.trim_threshold,
             fade,
         )?;
@@ -1995,6 +2041,13 @@ fn main() -> Result<()> {
     let voice = load_voice(&assets, &args.voice)?;
     let max_tokens = voice.rows - 1;
 
+    // espeak-ng voice: an explicit --espeak-voice wins, else derive it from the
+    // storytime voice's language prefix so the accent is phonemized correctly.
+    let espeak_voice = args
+        .espeak_voice
+        .clone()
+        .unwrap_or_else(|| espeak_voice_for(&args.voice).to_string());
+
     // Parse structure first so paragraph / section / chapter breaks survive
     // espeak-ng (which would otherwise flatten all whitespace).
     let blocks = parse_structure(&input_text);
@@ -2002,10 +2055,11 @@ fn main() -> Result<()> {
         bail!("no content after structural parsing");
     }
     eprintln!(
-        "storytime: {} block(s), voice={}, speed={}",
+        "storytime: {} block(s), voice={}, speed={}, espeak={}",
         blocks.len(),
         args.voice,
-        args.speed
+        args.speed,
+        espeak_voice
     );
 
     // Accumulate (preceding_gap, audio) pieces so we can insert the right
@@ -2096,6 +2150,7 @@ fn main() -> Result<()> {
             &mut rt,
             args.speed,
             args.pitch,
+            &espeak_voice,
             args.trim_threshold,
             fade,
         )?;
@@ -2507,6 +2562,22 @@ mod tests {
         assert!(cli.command.is_none());
         assert_eq!(cli.synth.voice, "af_bella");
         assert_eq!(cli.synth.output.as_deref(), Some(Path::new("/tmp/x.wav")));
+    }
+
+    #[test]
+    fn espeak_voice_is_derived_from_language_prefix() {
+        assert_eq!(espeak_voice_for("af_bella"), "en-us"); // American
+        assert_eq!(espeak_voice_for("am_adam"), "en-us");
+        assert_eq!(espeak_voice_for("bf_emma"), "en-gb"); // British
+        assert_eq!(espeak_voice_for("bm_george"), "en-gb");
+        assert_eq!(espeak_voice_for("ef_dora"), "es"); // Spanish
+        assert_eq!(espeak_voice_for("ff_siwis"), "fr-fr"); // French
+        assert_eq!(espeak_voice_for("jf_alpha"), "ja"); // Japanese
+        assert_eq!(espeak_voice_for("zf_xiaobei"), "cmn"); // Mandarin
+        // Names not following {lang}{gender}_ (e.g. a clone) default to English.
+        assert_eq!(espeak_voice_for("myvoice"), "en-us");
+        assert_eq!(espeak_voice_for("british_dad"), "en-us"); // no `_` at index 2
+        assert_eq!(espeak_voice_for(""), "en-us");
     }
 
     #[test]

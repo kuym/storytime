@@ -478,7 +478,8 @@ pub fn run(args: CloneArgs) -> Result<()> {
         Some(path) => {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading --ref-text {}", path.display()))?;
-            crate::run_espeak(&crate::normalize_punctuation(text.trim()))?
+            // Cloning is English-focused; the baked utterances use en-us too.
+            crate::run_espeak(&crate::normalize_punctuation(text.trim()), "en-us")?
         }
     };
     let target_tokens = crate::tokenize(&target_ipa, &vocab);
@@ -793,8 +794,8 @@ mod tests {
     #[test]
     #[ignore]
     fn regenerate_baked_ipa() {
-        let target = crate::run_espeak(&crate::normalize_punctuation(REFERENCE_SCRIPT)).unwrap();
-        let other = crate::run_espeak(&crate::normalize_punctuation(OTHER_TEXT)).unwrap();
+        let target = crate::run_espeak(&crate::normalize_punctuation(REFERENCE_SCRIPT), "en-us").unwrap();
+        let other = crate::run_espeak(&crate::normalize_punctuation(OTHER_TEXT), "en-us").unwrap();
         println!("const TARGET_IPA: &str = {target:?};");
         println!("const OTHER_IPA: &str = {other:?};");
     }
