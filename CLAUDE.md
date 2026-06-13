@@ -93,6 +93,11 @@ built with `--features mlx`, else ONNX). **Both run the same `kokoro.onnx` + `vo
   Metal into `cli/target/mlx-c/` (cached), links it + the Metal/Accelerate frameworks + `clang_rt.osx`
   (for `___isPlatformVersionAtLeast`), and runs bindgen over `mlx/c/mlx.h`. No vendored sources.
 
+`MlxRuntime` is a generic ONNX-graph interpreter: `Graph::load` is model-agnostic, the node loop and
+op set are reusable, and `synthesize()` is just a Kokoro-specific binding over the generic
+`run(inputs, output)`. Voice cloning reuses this to run `spk_encoder.onnx` (the GE2E encoder) on the
+GPU — so a second model shares the interpreter. When adding an op to `ops.rs`, both models benefit.
+
 The full verification story (op-for-op equivalence to ONNX Runtime CPU, the oscillator caveat, the
 CPU≡GPU check) is in `docs/onnx-to-mlx-plan.md`; the standalone parity/`--compare` harness lives in
 `spike/`.
@@ -110,8 +115,11 @@ stock voices → perturb a shared per-dim delta → synthesize two baked test ut
 + acoustic features, weighted harmonic mean) → write an ordinary `voices/<name>.bin`.
 `cli/src/dsp.rs` holds the analysis DSP: WAV reading, a librosa-parity power spectrogram
 (fixture-tested), YIN F0, and the `SpeakerEncoder` over `assets/spk_encoder.onnx` (exported by
-`export.py`; parity gated by `export/verify_spk.py` and the `#[ignore]`d `spk_embedding_*` test).
-The test-utterance IPA is baked into constants — regenerate with
+`export.py`; parity gated by `export/verify_spk.py` and the `#[ignore]`d `spk_embedding_*` tests).
+`SpeakerEncoder` runs on the resolved backend: ort-CPU under ONNX, or the MLX interpreter under MLX
+(so an mlx build keeps the whole loop on the GPU — the encoder added `Relu`/`ReduceL2` to `ops.rs`
+and uses `MlxRuntime::run`). The two encoders agree to cosine > 0.999, so scores are
+backend-independent. The test-utterance IPA is baked into constants — regenerate with
 `cargo test regenerate_baked_ipa -- --ignored --nocapture` after editing the texts. Design and
 deliberate deviations from upstream KVoiceWalk are in `docs/voice-cloning.md`.
 

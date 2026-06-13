@@ -72,6 +72,10 @@ CPU, op-for-op, to float32 epsilon (the only residual is the inherent f32
 conditioning of the vocoder's harmonic oscillator — see
 `docs/onnx-to-mlx-plan.md`).
 
+The same interpreter is reused for the GE2E speaker encoder in
+[voice cloning](#voice-cloning), so an `--features mlx` build runs the entire
+clone loop — synthesis and embedding — on the GPU.
+
 ```sh
 # Build with MLX support (requires Xcode + the Metal toolchain + macOS 14+).
 # First build clones and compiles mlx-c (~5 min); cached afterwards.
@@ -599,10 +603,13 @@ Set expectations accordingly: Kokoro is an 82 M-param model trained on a few
 hundred hours — the clone will be *recognizably you-ish*, not a studio-grade
 voice double. Results are stochastic; a different `--seed` can land a
 noticeably better (or worse) voice, and runs are cheap to repeat. Each step
-synthesizes one or two ~13 s test utterances, so expect on the order of
-0.2–0.5 steps/s depending on hardware and backend — the default `--steps 2000`
-is a multi-hour (typically overnight) walk, which is why `--budget-min`,
-mid-run auditioning, and `--resume` exist.
+synthesizes one or two ~13 s test utterances, so throughput is backend-bound —
+on the **MLX GPU backend the whole loop (synthesis *and* the speaker encoder)
+runs on the Metal GPU at ~2 steps/s**, versus ~0.2 steps/s on ONNX/CPU. Even at
+the faster rate the default `--steps 2000` is a long walk, which is why
+`--budget-min`, mid-run auditioning, and `--resume` exist. The two backends are
+verified to score identically (the embedding agrees to cosine > 0.999), so the
+choice is purely speed.
 
 ### Practical knobs
 
@@ -614,6 +621,7 @@ mid-run auditioning, and `--resume` exist.
 | `--seed` | `0` | RNG seed (best-effort reproducibility: CoreML/Metal inference is not bit-deterministic; use `--backend onnx` for stricter runs) |
 | `--resume` | | continue an interrupted walk from `voices/<name>.clone.json` |
 | `--ref-text FILE` | built-in script | transcript, if you recorded something other than `--print-script` (needs espeak-ng) |
+| `--backend` | `mlx` if built with `--features mlx`, else `onnx` | runs both synthesis and the speaker encoder; `mlx` keeps the whole loop on the GPU |
 
 While a walk runs, the current best is checkpointed to `voices/<name>.bin`
 every 50 acceptances — you can **audition mid-run** from another terminal with

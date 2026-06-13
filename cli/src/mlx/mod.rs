@@ -342,43 +342,73 @@ impl MlxRuntime {
     /// Synthesize one chunk. `tokens` are phoneme token ids (no padding),
     /// `style` is the 256-dim voice row, `speed` the rate multiplier.
     pub fn synthesize(&self, tokens: &[i64], style: &[f32], speed: f32) -> Result<Vec<f32>> {
-        // Activate the per-node temporary arena (track/track_vec register here).
-        // synthesize_inner clears it after every node, freeing that node's
-        // intermediates, and frees long-lived values via liveness analysis — so
-        // only the live working set is resident, not the whole forward pass.
+        self.with_arena(|| {
+            let mut ids = Vec::with_capacity(tokens.len() + 2);
+            ids.push(0);
+            ids.extend_from_slice(tokens);
+            ids.push(0);
+            let mut env = self.weights_env();
+            env.insert("input_ids".into(), Val::A(from_i64(&ids, &[1, ids.len() as i32])));
+            env.insert("style".into(), Val::A(from_f32(style, &[1, style.len() as i32])));
+            env.insert("speed".into(), Val::A(from_f32(&[speed], &[1])));
+            let (audio, _shape) = self.eval_graph(env, "audio")?;
+            Ok(audio)
+        })
+    }
+
+    /// Run the loaded graph generically: bind each `(name, row-major data,
+    /// shape)` input and return the named `output`'s host data + shape. Lets a
+    /// second model — the GE2E speaker encoder used by `storytime clone` — reuse
+    /// the exact same MLX interpreter and Metal stream as Kokoro synthesis,
+    /// keeping the whole cloning loop GPU-resident.
+    pub fn run(
+        &self,
+        inputs: &[(&str, &[f32], &[i32])],
+        output: &str,
+    ) -> Result<(Vec<f32>, Vec<i32>)> {
+        self.with_arena(|| {
+            let mut env = self.weights_env();
+            for (name, data, shp) in inputs {
+                env.insert((*name).to_string(), Val::A(from_f32(data, shp)));
+            }
+            self.eval_graph(env, output)
+        })
+    }
+
+    /// A fresh env seeded with the persistent weight arrays.
+    fn weights_env(&self) -> Env {
+        let mut env: Env = HashMap::new();
+        for (k, v) in &self.graph.weights {
+            env.insert(k.clone(), Val::A(*v));
+        }
+        env
+    }
+
+    /// Activate the per-node temporary arena (track/track_vec register here),
+    /// run `f`, then tear the arena down and return idle GPU buffers to the OS.
+    /// Calls must not nest — the arena is process-global, and the clone loop
+    /// synthesizes then embeds strictly in turn, never concurrently.
+    fn with_arena<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         unsafe {
             ARENA = Some(Vec::new());
             VARENA = Some(Vec::new());
         }
-        let result = self.synthesize_inner(tokens, style, speed);
+        let result = f();
         unsafe {
             ARENA = None;
             VARENA = None;
-            // Return cached (idle) buffers to the OS between chunks so peak
-            // footprint reflects one chunk's working set, not the high-water
-            // mark of every chunk seen so far.
+            // Return cached (idle) buffers to the OS so peak footprint reflects
+            // one call's working set, not the high-water mark of every call.
             mlx_clear_cache();
         }
         result
     }
 
-    fn synthesize_inner(&self, tokens: &[i64], style: &[f32], speed: f32) -> Result<Vec<f32>> {
-        let mut ids = Vec::with_capacity(tokens.len() + 2);
-        ids.push(0);
-        ids.extend_from_slice(tokens);
-        ids.push(0);
-        let input_ids = from_i64(&ids, &[1, ids.len() as i32]);
-        let style_a = from_f32(style, &[1, style.len() as i32]);
-        let speed_a = from_f32(&[speed], &[1]);
-
-        let mut env: Env = HashMap::new();
-        for (k, v) in &self.graph.weights {
-            env.insert(k.clone(), Val::A(*v));
-        }
-        env.insert("input_ids".into(), Val::A(input_ids));
-        env.insert("style".into(), Val::A(style_a));
-        env.insert("speed".into(), Val::A(speed_a));
-
+    /// Interpret the graph to completion: eval_graph clears the temp arena after
+    /// every node (freeing that node's intermediates) and frees long-lived values
+    /// via liveness analysis, so only the live working set is resident — not the
+    /// whole forward pass. Reads `output` to a host Vec and frees the rest.
+    fn eval_graph(&self, mut env: Env, output: &str) -> Result<(Vec<f32>, Vec<i32>)> {
         let wctx = &self.weight_ctx;
         // Force evaluation every `eval_every` nodes (see below). Larger values
         // submit more GPU work per flush (fewer sync round-trips) at the cost of
@@ -490,14 +520,15 @@ impl MlxRuntime {
             free_dead(&dead, &env, wctx);
         }
 
-        let audio = match env.get("audio") {
+        let out_arr = match env.get(output) {
             Some(Val::A(a)) => *a,
-            _ => bail!("MLX interpreter produced no audio output"),
+            _ => bail!("MLX interpreter produced no output '{output}'"),
         };
-        let out = read_f32(audio); // copies to a host Vec
+        let out_shape = shape(out_arr);
+        let out = read_f32(out_arr); // copies to a host Vec
 
         // Final cleanup: free the read temporaries and every remaining non-weight
-        // value (the audio buffer and any produced-but-unconsumed outputs).
+        // value (the output buffer and any produced-but-unconsumed outputs).
         unsafe {
             let mut seen: HashSet<usize> = HashSet::new();
             for &a in ARENA.as_mut().unwrap().iter() {
@@ -530,7 +561,7 @@ impl MlxRuntime {
                 }
             }
         }
-        Ok(out)
+        Ok((out, out_shape))
     }
 }
 

@@ -82,8 +82,17 @@ component to backslide if the combined score improves, while punishing any compo
 ### Speaker embedding
 
 Resemblyzer's GE2E encoder (~1.4 M params, 256-d L2-normalized output, exactly what KVoiceWalk
-scores with). Exported once, offline, by `export/export.py` to `assets/spk_encoder.onnx` (~5.5 MB)
-and run on CPU via the existing `ort` dependency.
+scores with). Exported once, offline, by `export/export.py` to `assets/spk_encoder.onnx` (~5.5 MB).
+
+It runs on **whichever backend the clone is using**: with `--backend mlx` the encoder runs through
+the same native ONNX→MLX interpreter as Kokoro synthesis (`crate::mlx::MlxRuntime`), so the entire
+optimization loop is GPU-resident with no per-step CPU bounce; otherwise it runs on ONNX Runtime
+(CPU). The interpreter needed only two new ops for this graph — `Relu` and `ReduceL2` — on top of
+the set Kokoro already exercises (`LSTM`, `MatMul`, `Gemm`, …). The two paths are verified to agree
+to cosine > 0.999 (`spk_embedding_mlx_matches_ort`), so the cloning score does not depend on which
+backend produced the embedding. `MlxRuntime::run(inputs, output)` is the generic graph-execution
+entry point added so a second model can reuse the interpreter; `synthesize()` is now a thin
+Kokoro-specific wrapper over it.
 
 **Parity trick:** the ONNX graph's input is the 201-bin *power spectrogram* (n_fft = 400,
 hop = 160, hann, centered/reflect-padded, 16 kHz) and the librosa Slaney 40-mel filterbank is
@@ -103,8 +112,8 @@ IPA is baked in as a constant, plus a second baked "other text" for self-similar
 
 - espeak-ng is **not** required at clone time (IPA was generated once at development time);
 - the target embedding comparison is text-matched (KVoiceWalk semantics);
-- token counts are fixed → only ~2 input shapes ever hit the backend → CoreML cache is warm from
-  iteration 1.
+- token counts are fixed → only ~2 input shapes ever hit the backend (warm ONNX/CoreML compile
+  cache from iteration 1; on MLX the recurring shapes likewise keep the buffer cache hot).
 
 `--ref-text <file>` allows a custom transcript (this path does run espeak-ng).
 
@@ -131,9 +140,10 @@ IPA is baked in as a constant, plus a second baked "other text" for self-similar
 
 | file | role |
 |---|---|
-| `cli/src/main.rs` | `Cli { Option<Cmd>, flatten Args }` wrapper (legacy flag-only invocation unchanged); `init_backend()` extracted so clone reuses the ONNX/MLX session construction and `synth_chunk_dispatch` |
+| `cli/src/main.rs` | `Cli { Option<Cmd>, flatten Args }` wrapper (legacy flag-only invocation unchanged); `Runtime { init, synth }` wraps the ONNX/MLX backend so clone reuses the exact synthesis path |
 | `cli/src/clone.rs` | `CloneArgs`, walk loop, scoring, init blend / auto-rank, checkpoint/resume, `write_voice_bin`, baked IPA constants |
-| `cli/src/dsp.rs` | WAV reading (hound `WavReader`), resampling, power spectrogram (realfft), YIN F0, acoustic stats, `SpeakerEncoder` (ort CPU session), SplitMix64 RNG |
+| `cli/src/dsp.rs` | WAV reading (hound `WavReader`), resampling, power spectrogram (realfft), YIN F0, acoustic stats, `SpeakerEncoder` (ort-CPU or MLX-GPU per backend), SplitMix64 RNG |
+| `cli/src/mlx/{mod,ops}.rs` | `MlxRuntime::run(inputs, output)` generic graph entry point (the encoder reuses it); `Relu` + `ReduceL2` ops added for the GE2E graph |
 | `export/export.py` | `+ GE2EWrapper` export → `assets/spk_encoder.onnx` (mel filterbank baked in); weights from the `resemblyzer` pip package or a pinned HF mirror; `--skip-spk` flag |
 | `export/verify_spk.py` | parity script: Resemblyzer vs exported ONNX cosine (expect > 0.999); `--dump-fixture` emits the Rust spectrogram test fixture |
 | `cli/Cargo.toml` | `+ realfft` (the only new crate; no `rand`, no pitch crate) |
@@ -147,8 +157,12 @@ as `seed + step` so it doesn't replay the same perturbations).
 1. **Unit tests** — spectrogram vs a librosa-generated fixture; YIN on synthetic sines (± 2 Hz);
    seeded RNG stability; `write_voice_bin` ↔ `load_voice` round-trip; blend math; legacy CLI parse
    still resolves to no-subcommand.
-2. **Embedding parity gate** (run before trusting any walk): `python export/verify_spk.py ref.wav`
-   → Resemblyzer-vs-ONNX cosine > 0.999; Rust frontend vs Python on the same file > 0.99.
+2. **Embedding parity gates** (run before trusting any walk):
+   - Rust ONNX path vs Python: `python export/verify_spk.py ref.wav` → Resemblyzer-vs-ONNX
+     cosine > 0.999; then `cargo test spk_embedding_matches_python_frontend -- --ignored` for the
+     Rust frontend vs Python (> 0.999).
+   - MLX vs ONNX: `cargo test --features mlx spk_embedding_mlx_matches_ort -- --ignored` (> 0.999),
+     so the MLX-GPU encoder scores identically to the ONNX one.
 3. **Integration smoke test** (skips politely when gitignored assets are absent): synthesize a fake
    "reference" from `af_bella`, run 20 clone steps initialized from `am_adam`, assert a finite
    weakly-improving score and a loadable `.bin`.

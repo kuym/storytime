@@ -352,6 +352,15 @@ pub fn run(args: CloneArgs) -> Result<()> {
     let assets = crate::assets_dir(args.assets.as_deref())?;
     let vocab = crate::load_tokens(&assets)?;
 
+    // Resolve the backend up front: it selects not only Kokoro synthesis but
+    // also the speaker encoder (MLX runs both on the GPU; ONNX uses ort-CPU for
+    // the encoder), so it must be known before the reference is embedded.
+    let backend = args.backend.unwrap_or(if cfg!(feature = "mlx") {
+        Backend::Mlx
+    } else {
+        Backend::Onnx
+    });
+
     // --- Reference recording -> embedding + acoustic stats.
     let (ref_wav, ref_sr) = dsp::read_wav_mono(ref_path)?;
     let secs = ref_wav.len() as f32 / ref_sr as f32;
@@ -366,7 +375,7 @@ pub fn run(args: CloneArgs) -> Result<()> {
     if ref_16k.is_empty() {
         bail!("reference recording is silent");
     }
-    let mut enc = SpeakerEncoder::load(&assets)?;
+    let mut enc = SpeakerEncoder::load(&assets, backend)?;
     let ref_emb = enc.embed(&ref_16k)?;
     let ref_stats = dsp::acoustic_stats(&ref_16k, SPK_SR);
     eprintln!(
@@ -409,11 +418,6 @@ pub fn run(args: CloneArgs) -> Result<()> {
         );
     }
 
-    let backend = args.backend.unwrap_or(if cfg!(feature = "mlx") {
-        Backend::Mlx
-    } else {
-        Backend::Onnx
-    });
     let cache = crate::resolve_coreml_cache(args.no_coreml_cache, args.coreml_cache.as_deref())?;
     let mut rt = Runtime::init(backend, &assets, cache)?;
 

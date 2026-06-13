@@ -15,7 +15,7 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use realfft::RealFftPlanner;
 
-use crate::ort_err;
+use crate::{ort_err, Backend};
 
 /// The speaker encoder consumes 16 kHz audio (Resemblyzer convention).
 pub const SPK_SR: u32 = 16_000;
@@ -142,15 +142,22 @@ fn partial_slices(n_samples: usize) -> (Vec<usize>, usize) {
 }
 
 // ---------------------------------------------------------------------------
-// Speaker encoder (GE2E via ONNX Runtime, CPU)
+// Speaker encoder (GE2E over spk_encoder.onnx)
 // ---------------------------------------------------------------------------
 
-pub struct SpeakerEncoder {
-    session: Session,
+/// The GE2E speaker encoder. With the MLX backend it runs on the same Metal
+/// stream as Kokoro synthesis (via the native ONNX interpreter in `crate::mlx`),
+/// keeping the whole `clone` loop GPU-resident; otherwise it runs on ONNX
+/// Runtime (CPU). Both consume the identical power-spectrogram frontend below
+/// and are verified to agree to cosine > 0.999 (see the mlx parity test).
+pub enum SpeakerEncoder {
+    Ort(Session),
+    #[cfg(feature = "mlx")]
+    Mlx(Box<crate::mlx::MlxRuntime>),
 }
 
 impl SpeakerEncoder {
-    pub fn load(assets: &Path) -> Result<Self> {
+    pub fn load(assets: &Path, backend: Backend) -> Result<Self> {
         let path = assets.join("spk_encoder.onnx");
         if !path.exists() {
             bail!(
@@ -159,6 +166,18 @@ impl SpeakerEncoder {
                 path.display()
             );
         }
+        #[cfg(feature = "mlx")]
+        if backend == Backend::Mlx {
+            let device = if crate::mlx::gpu_available() {
+                crate::mlx::Device::Gpu
+            } else {
+                crate::mlx::Device::Cpu
+            };
+            return Ok(SpeakerEncoder::Mlx(Box::new(crate::mlx::MlxRuntime::new(
+                &path, device,
+            )?)));
+        }
+        let _ = backend;
         // Safe to call alongside Runtime::init: committing the ort environment
         // is idempotent for our purposes. The encoder is a 1.4 M-param LSTM;
         // plain CPU execution is plenty.
@@ -169,7 +188,7 @@ impl SpeakerEncoder {
             .map_err(ort_err)?
             .commit_from_file(&path)
             .map_err(ort_err)?;
-        Ok(SpeakerEncoder { session })
+        Ok(SpeakerEncoder::Ort(session))
     }
 
     /// Embed a 16 kHz mono utterance: L2-normalized 256-d speaker embedding
@@ -188,26 +207,17 @@ impl SpeakerEncoder {
         let (spec, n_frames) = power_spectrogram(&wav);
         debug_assert!(starts.iter().all(|s| s + PARTIAL_FRAMES <= n_frames));
 
-        let mut batch = Vec::with_capacity(starts.len() * PARTIAL_FRAMES * N_BINS);
+        let n = starts.len();
+        let mut batch = Vec::with_capacity(n * PARTIAL_FRAMES * N_BINS);
         for &s in &starts {
             batch.extend_from_slice(&spec[s * N_BINS..(s + PARTIAL_FRAMES) * N_BINS]);
         }
-        let tensor = Tensor::from_array((
-            vec![starts.len() as i64, PARTIAL_FRAMES as i64, N_BINS as i64],
-            batch,
-        ))
-        .map_err(ort_err)?;
-        let outputs = self
-            .session
-            .run(ort::inputs!["power_spec" => tensor])
-            .map_err(ort_err)?;
-        let (_shape, partials) = outputs["embedding"]
-            .try_extract_tensor::<f32>()
-            .map_err(ort_err)?;
+        // Per-window embeddings, row-major [n, 256].
+        let partials = self.run_model(&batch, n)?;
 
         // L2-normalizing the mean of partials == L2-normalizing their sum.
         let mut mean = [0f32; EMBED_DIM];
-        for p in 0..starts.len() {
+        for p in 0..n {
             for (d, m) in mean.iter_mut().enumerate() {
                 *m += partials[p * EMBED_DIM + d];
             }
@@ -217,6 +227,33 @@ impl SpeakerEncoder {
             *m /= norm;
         }
         Ok(mean)
+    }
+
+    /// Run the encoder over a `[n, PARTIAL_FRAMES, N_BINS]` power-spectrogram
+    /// batch, returning per-window embeddings as row-major `[n, 256]`.
+    fn run_model(&mut self, batch: &[f32], n: usize) -> Result<Vec<f32>> {
+        match self {
+            SpeakerEncoder::Ort(session) => {
+                let tensor = Tensor::from_array((
+                    vec![n as i64, PARTIAL_FRAMES as i64, N_BINS as i64],
+                    batch.to_vec(),
+                ))
+                .map_err(ort_err)?;
+                let outputs = session
+                    .run(ort::inputs!["power_spec" => tensor])
+                    .map_err(ort_err)?;
+                let (_shape, partials) = outputs["embedding"]
+                    .try_extract_tensor::<f32>()
+                    .map_err(ort_err)?;
+                Ok(partials.to_vec())
+            }
+            #[cfg(feature = "mlx")]
+            SpeakerEncoder::Mlx(rt) => {
+                let shp = [n as i32, PARTIAL_FRAMES as i32, N_BINS as i32];
+                let (data, _shape) = rt.run(&[("power_spec", batch, &shp)], "embedding")?;
+                Ok(data)
+            }
+        }
     }
 }
 
@@ -611,11 +648,31 @@ mod tests {
         let assets = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("assets");
         let (wav, sr) = read_wav_mono(Path::new("/tmp/spk_parity.wav")).unwrap();
         let wav16k = crate::resample(&wav, sr, SPK_SR).unwrap();
-        let ours = SpeakerEncoder::load(&assets).unwrap().embed(&wav16k).unwrap();
+        let ours = SpeakerEncoder::load(&assets, Backend::Onnx)
+            .unwrap()
+            .embed(&wav16k)
+            .unwrap();
         let json = std::fs::read_to_string("/tmp/spk_parity_emb.json").unwrap();
         let python: Vec<f32> = serde_json::from_str(&json).unwrap();
         let cos = cosine(&ours, &python);
         assert!(cos > 0.999, "Rust-vs-Python embedding cosine too low: {cos}");
+    }
+
+    /// Parity between the MLX-interpreter encoder and the ONNX-Runtime encoder:
+    /// the cloning score must not depend on which backend computed the
+    /// embedding. Run manually (needs the mlx build + assets + the wav above):
+    ///   cargo test --features mlx spk_embedding_mlx -- --ignored
+    #[cfg(feature = "mlx")]
+    #[test]
+    #[ignore]
+    fn spk_embedding_mlx_matches_ort() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("assets");
+        let (wav, sr) = read_wav_mono(Path::new("/tmp/spk_parity.wav")).unwrap();
+        let wav16k = crate::resample(&wav, sr, SPK_SR).unwrap();
+        let ort = SpeakerEncoder::load(&assets, Backend::Onnx).unwrap().embed(&wav16k).unwrap();
+        let mlx = SpeakerEncoder::load(&assets, Backend::Mlx).unwrap().embed(&wav16k).unwrap();
+        let cos = cosine(&ort, &mlx);
+        assert!(cos > 0.999, "MLX-vs-ONNX embedding cosine too low: {cos}");
     }
 
     #[test]

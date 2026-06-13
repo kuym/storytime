@@ -238,6 +238,15 @@ fn run_node(n: &Node, env: &mut Env) -> Vec<(String, Val)> {
         }
         "ReduceSum" => reduce(env, n, mlx_sum_axes),
         "ReduceMax" => reduce(env, n, mlx_max_axes),
+        "Relu" => one(op!(mlx_maximum, ga(env, &n.input[0]), scalar_f32(0.0))),
+        "ReduceL2" => {
+            // L2 norm over `axes` = sqrt(sum(x^2)). Used by the GE2E speaker
+            // encoder's final embedding normalization (storytime clone).
+            let a = ga(env, &n.input[0]);
+            let (ai, keep) = reduce_axes(env, n, a);
+            let sq = op!(mlx_multiply, a, a);
+            one(op!(mlx_sqrt, op!(mlx_sum_axes, sq, ai.as_ptr(), ai.len(), keep)))
+        }
         "ReduceProd" => reduce(env, n, mlx_prod_axes),
 
         // ---- linear algebra ----
@@ -489,14 +498,11 @@ fn run_node(n: &Node, env: &mut Env) -> Vec<(String, Val)> {
     }
 }
 
-fn reduce(
-    env: &Env,
-    n: &Node,
-    f: unsafe extern "C" fn(*mut mlx_array, mlx_array, *const i32, usize, bool, mlx_stream) -> i32,
-) -> Vec<(String, Val)> {
-    let a = ga(env, &n.input[0]);
+/// Resolve a reduction's axes (input[1] in newer opsets, else the `axes`
+/// attribute; empty = all axes) and the keepdims flag.
+fn reduce_axes(env: &Env, n: &Node, a: mlx_array) -> (Vec<i32>, bool) {
     let r = ndim(a) as i64;
-    let mut axes = if n.input.len() > 1 {
+    let mut axes = if n.input.len() > 1 && has(env, &n.input[1]) {
         read_i64(ga(env, &n.input[1]))
     } else {
         n.aints("axes")
@@ -509,8 +515,16 @@ fn reduce(
             *ax += r;
         }
     }
-    let ai: Vec<i32> = axes.iter().map(|&x| x as i32).collect();
-    let keep = n.ai("keepdims", 1) != 0;
+    (axes.iter().map(|&x| x as i32).collect(), n.ai("keepdims", 1) != 0)
+}
+
+fn reduce(
+    env: &Env,
+    n: &Node,
+    f: unsafe extern "C" fn(*mut mlx_array, mlx_array, *const i32, usize, bool, mlx_stream) -> i32,
+) -> Vec<(String, Val)> {
+    let a = ga(env, &n.input[0]);
+    let (ai, keep) = reduce_axes(env, n, a);
     let out = op!(f, a, ai.as_ptr(), ai.len(), keep);
     vec![(n.output[0].clone(), Val::A(out))]
 }
