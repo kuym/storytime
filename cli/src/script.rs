@@ -13,6 +13,7 @@
 //! ALICE: female, american, young
 //! BOB: male, british, gruff
 //! NARRATOR: af_heart            # explicit voice id also allowed
+//! GIANT: bm_george pitch=-5     # optional per-character pitch (semitones)
 //!
 //! ---
 //!
@@ -23,6 +24,9 @@
 //!
 //! - The **cast block** is the lines under a `Cast` / `Dramatis Personae`
 //!   heading, ending at the next heading or `---` rule. It is never spoken.
+//! - A cast line may carry a `pitch=<semitones>` token (e.g. `pitch=-5`,
+//!   `pitch=+8`) to shift that character's voice; without one, the global
+//!   `--pitch` applies.
 //! - A **speech** starts at a `NAME:` line whose `NAME` is a declared character
 //!   or is written in screenplay all-caps; the remainder plus any following
 //!   non-speaker lines (until a blank line or the next speaker) is that
@@ -47,11 +51,15 @@ pub enum VoiceSpec {
 }
 
 /// One declared character and the voice it requests.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CastEntry {
     /// Display name as written (e.g. `ALICE`).
     pub name: String,
     pub spec: VoiceSpec,
+    /// Optional per-character pitch shift in semitones, from a `pitch=<n>`
+    /// annotation in the cast line (e.g. `GIANT: bm_george pitch=-5`). `None`
+    /// falls back to the global `--pitch`.
+    pub pitch: Option<f32>,
 }
 
 /// One continuous turn of speech by a single character.
@@ -168,17 +176,45 @@ fn parse_cast_line(line: &str) -> Option<CastEntry> {
             if name.is_empty() {
                 return None;
             }
+            let (spec, pitch) = extract_pitch(spec.trim());
             Some(CastEntry {
                 name: name.to_string(),
                 spec: parse_spec(spec.trim()),
+                pitch,
             })
         }
         // Bare name with no spec → fully auto-assigned.
         None => Some(CastEntry {
             name: line.to_string(),
             spec: VoiceSpec::Traits(Vec::new()),
+            pitch: None,
         }),
     }
+}
+
+/// Pull a `pitch=<semitones>` token out of a cast spec (case-insensitive, an
+/// optional `st` suffix allowed), returning the remaining spec and the pitch.
+/// `pitch=-5`, `pitch=+3`, `pitch=8st` all parse; anything else stays in the
+/// spec so the voice resolver sees it unchanged.
+fn extract_pitch(spec: &str) -> (String, Option<f32>) {
+    let mut pitch = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for tok in spec.split([',', ' ', '\t']) {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let lower = t.to_ascii_lowercase();
+        if let Some(val) = lower.strip_prefix("pitch=") {
+            let val = val.trim_end_matches("st").trim_end_matches("semitones");
+            if let Ok(p) = val.parse::<f32>() {
+                pitch = Some(p);
+                continue;
+            }
+        }
+        kept.push(t);
+    }
+    (kept.join(" "), pitch)
 }
 
 /// Parse the voice spec after a cast entry's colon.
@@ -592,9 +628,31 @@ mod tests {
             CastEntry {
                 name: "ALICE".into(),
                 spec: VoiceSpec::Traits(vec!["female".into(), "american".into(), "young".into()]),
+                pitch: None,
             }
         );
         assert_eq!(s.cast[2].spec, VoiceSpec::Explicit("af_heart".into()));
+    }
+
+    #[test]
+    fn cast_pitch_annotation_is_parsed_and_voice_unaffected() {
+        let input = "# Cast\n\
+            GIANT: bm_george pitch=-5\n\
+            MOUSE: female, young, pitch=+8\n\
+            FAIRY: af_bella pitch=3st\n\
+            PLAIN: af_heart\n\n---\n\nGIANT: Fee fi fo fum.\n";
+        let s = parse(input, None).unwrap();
+        // Voice spec is preserved; pitch is pulled out separately.
+        assert_eq!(s.cast[0].spec, VoiceSpec::Explicit("bm_george".into()));
+        assert_eq!(s.cast[0].pitch, Some(-5.0));
+        assert_eq!(
+            s.cast[1].spec,
+            VoiceSpec::Traits(vec!["female".into(), "young".into()])
+        );
+        assert_eq!(s.cast[1].pitch, Some(8.0));
+        assert_eq!(s.cast[2].spec, VoiceSpec::Explicit("af_bella".into())); // `st` suffix
+        assert_eq!(s.cast[2].pitch, Some(3.0));
+        assert_eq!(s.cast[3].pitch, None); // no annotation
     }
 
     #[test]
@@ -654,8 +712,8 @@ mod tests {
     #[test]
     fn resolve_filters_by_gender_and_accent() {
         let cast = vec![
-            CastEntry { name: "ALICE".into(), spec: VoiceSpec::Traits(vec!["female".into(), "american".into()]) },
-            CastEntry { name: "BOB".into(), spec: VoiceSpec::Traits(vec!["male".into(), "british".into()]) },
+            CastEntry { name: "ALICE".into(), spec: VoiceSpec::Traits(vec!["female".into(), "american".into()]), pitch: None },
+            CastEntry { name: "BOB".into(), spec: VoiceSpec::Traits(vec!["male".into(), "british".into()]), pitch: None },
         ];
         let speakers = vec!["alice".into(), "bob".into()];
         let (m, _w) = resolve_voices(&cast, &speakers, &voices(), "af_heart");
@@ -666,8 +724,8 @@ mod tests {
     #[test]
     fn resolve_keeps_voices_distinct_and_deterministic() {
         let cast = vec![
-            CastEntry { name: "A".into(), spec: VoiceSpec::Traits(vec!["female".into(), "american".into()]) },
-            CastEntry { name: "B".into(), spec: VoiceSpec::Traits(vec!["female".into(), "american".into()]) },
+            CastEntry { name: "A".into(), spec: VoiceSpec::Traits(vec!["female".into(), "american".into()]), pitch: None },
+            CastEntry { name: "B".into(), spec: VoiceSpec::Traits(vec!["female".into(), "american".into()]), pitch: None },
         ];
         let speakers = vec!["a".into(), "b".into()];
         let (m1, _) = resolve_voices(&cast, &speakers, &voices(), "af_heart");
@@ -678,7 +736,7 @@ mod tests {
 
     #[test]
     fn resolve_explicit_passthrough_and_narrator_default() {
-        let cast = vec![CastEntry { name: "X".into(), spec: VoiceSpec::Explicit("bm_george".into()) }];
+        let cast = vec![CastEntry { name: "X".into(), spec: VoiceSpec::Explicit("bm_george".into()), pitch: None }];
         let speakers = vec!["x".into(), "narrator".into()];
         let (m, _w) = resolve_voices(&cast, &speakers, &voices(), "af_heart");
         assert_eq!(m["x"], "bm_george");

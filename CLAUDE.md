@@ -73,6 +73,13 @@ because each stage assumes the previous one's invariants:
    both take the same `(tokens, style, speed)`) → per-chunk `trim_silence` + `apply_fade` + typed
    silence gap → concat → `resample` → `write_wav`/playback.
 
+`--pitch` (semitones) is a **tempo-preserving** shift done without a phase vocoder: synthesize at
+`speed / r` (Kokoro's `speed` is a clean model-level time-stretch that holds pitch constant) then
+`resample_ratio` the chunk by `1/r`, where `r = pitch_ratio(semitones) = 2^(semitones/12)`. Net:
+frequencies × r, duration unchanged. `r == 1` is a no-op. Script mode carries a per-character pitch
+(cast `pitch=<n>` annotation, else the global `--pitch`); it joins `voice_id` in the turn-merge key
+so turns with different pitch aren't coalesced.
+
 When changing any stage, keep these contracts intact: sentinels must survive stages 2–3; punctuation
 in `PRESERVED_PUNCT` must round-trip through stage 4; nothing downstream of stage 4 should see raw
 graphemes.

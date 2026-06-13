@@ -44,7 +44,8 @@ plain float32 voice tensors that the Rust CLI consumes.
   Italian, Hindi, Japanese, Brazilian Portuguese, Mandarin).
 - **Configurable output.** 16/24/32-bit PCM or IEEE float32, any sample rate
   (resampled from the model's native 24 kHz via a high-quality sinc resampler).
-- **Adjustable speaking rate** via `--speed`.
+- **Adjustable speaking rate** via `--speed`, and **pitch shifting** via `--pitch`
+  (semitones, tempo-preserving) — global, or per character in script mode.
 - **Voice cloning.** `storytime clone` builds a new voicepack from a 10–20 s
   recording of a real speaker via offline style-space optimization — see
   [Voice cloning](#voice-cloning).
@@ -476,6 +477,7 @@ A complete example:
 ALICE: female, american, young
 BOB: male, british, gruff
 NARRATOR: af_heart            # an explicit voice id also works
+GIANT: bm_george pitch=-5     # optional per-character pitch shift
 
 ---
 
@@ -502,6 +504,10 @@ be precise):
 - **Speech** — a line beginning `NAME:` (a declared character, or any name in
   screenplay all-caps) starts that character's turn; following non-speaker lines,
   up to a blank line or the next speaker, belong to it.
+- **Pitch** — a cast entry may add `pitch=<semitones>` (e.g. `pitch=-5` to drop a
+  giant's voice, `pitch=+8` to lift a mouse's). It shifts that character's pitch
+  while preserving tempo. Characters without one use the global `--pitch` (default
+  `0`), so `--script --pitch 2` lifts the whole scene except where overridden.
 - **Narration** — lines with no speaker are spoken by `NARRATOR` (or `--narrator`
   / `--voice` if no narrator is cast).
 - **Interruptions** — end a speech with `--` or `—` and the next speech overlaps
@@ -522,6 +528,7 @@ leaving the body as pure dialogue. `--script` is incompatible with `--ipa`.
 | `--sample-rate HZ` | `24000` | output sample rate; model native is 24 kHz |
 | `--bit-depth {16,24,32,float32}` | `16` | PCM bit depth |
 | `--speed FLOAT` | `1.0` | speaking rate multiplier |
+| `--pitch SEMITONES` | `0` | pitch shift in semitones (+ up / − down), tempo preserved; script-mode default (see below) |
 | `--ipa` | off | treat stdin as IPA (skip espeak-ng) |
 | `--assets PATH` | `../assets` | location of exported assets |
 | `--list-voices` | — | list available voices and exit |

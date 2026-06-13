@@ -117,6 +117,13 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     speed: f32,
 
+    /// Pitch shift in semitones (+ raises, − lowers), e.g. `--pitch 4` or
+    /// `--pitch -3`. Tempo is preserved: the model re-times the speech and the
+    /// audio is resampled to restore the original duration. In --script mode
+    /// this is the default for any character without a `pitch=` cast annotation.
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    pitch: f32,
+
     /// Treat stdin as IPA phonemes rather than text (no espeak-ng invocation).
     #[arg(long)]
     ipa: bool,
@@ -1177,6 +1184,16 @@ fn resample(samples: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
     if from == to {
         return Ok(samples.to_vec());
     }
+    resample_ratio(samples, to as f64 / from as f64)
+}
+
+/// Resample so the output has `ratio ×` the samples (output_len ≈ input_len ×
+/// ratio). Used for sample-rate conversion (ratio = to/from) and for pitch
+/// shifting (ratio = 1/r, reinterpreted at the same rate to scale frequencies).
+fn resample_ratio(samples: &[f32], ratio: f64) -> Result<Vec<f32>> {
+    if (ratio - 1.0).abs() < 1e-9 || samples.is_empty() {
+        return Ok(samples.to_vec());
+    }
     let params = SincInterpolationParameters {
         sinc_len: 256,
         f_cutoff: 0.95,
@@ -1184,15 +1201,14 @@ fn resample(samples: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
         oversampling_factor: 256,
         window: WindowFunction::BlackmanHarris2,
     };
-    let mut r = SincFixedIn::<f32>::new(
-        to as f64 / from as f64,
-        2.0,
-        params,
-        samples.len(),
-        1,
-    )?;
+    let mut r = SincFixedIn::<f32>::new(ratio, 2.0, params, samples.len(), 1)?;
     let out = r.process(&[samples.to_vec()], None)?;
     Ok(out.into_iter().next().unwrap())
+}
+
+/// Frequency multiplier for a pitch shift of `semitones` (12 semitones → 2×).
+fn pitch_ratio(semitones: f32) -> f32 {
+    2f32.powf(semitones / 12.0)
 }
 
 /// Stream a WAV to any writer without seeking.
@@ -1637,6 +1653,7 @@ fn synthesize_voice_chunks(
     max_tokens: usize,
     rt: &mut Runtime,
     speed: f32,
+    pitch_semitones: f32,
     trim_threshold: f32,
     fade: usize,
 ) -> Result<Vec<Vec<f32>>> {
@@ -1646,6 +1663,14 @@ fn synthesize_voice_chunks(
         run_espeak(text)?
     };
     let chunks = chunk_ipa(&ipa, vocab, max_tokens);
+
+    // Pitch shift, tempo-preserving: synthesize at `speed / r` (the model's own
+    // time-stretch, which keeps pitch constant) so the audio is `r ×` longer,
+    // then resample to `1/r` length — scaling every frequency by `r` and
+    // restoring the original duration. r = 1 (pitch 0) is a no-op on both.
+    let r = pitch_ratio(pitch_semitones);
+    let synth_speed = speed / r;
+
     let mut bufs = Vec::new();
     for chunk in &chunks {
         let tokens = tokenize(chunk, vocab);
@@ -1653,7 +1678,12 @@ fn synthesize_voice_chunks(
             continue;
         }
         let style = select_style(voice, tokens.len());
-        let audio = rt.synth(&tokens, style, speed)?;
+        let audio = rt.synth(&tokens, style, synth_speed)?;
+        let audio = if (r - 1.0).abs() > 1e-6 {
+            resample_ratio(&audio, 1.0 / r as f64)?
+        } else {
+            audio
+        };
         let mut buf = trim_silence(&audio, trim_threshold).to_vec();
         apply_fade(&mut buf, fade);
         bufs.push(buf);
@@ -1782,8 +1812,20 @@ fn run_script(
         parsed.speeches.len(),
         speakers.len()
     );
+    // Per-character pitch: an explicit `pitch=` cast annotation, else the global
+    // --pitch default. Keyed by the lowercased character name (matching
+    // `Speech::character`).
+    let mut char_pitch: HashMap<String, f32> = HashMap::new();
+    for e in &parsed.cast {
+        if let Some(p) = e.pitch {
+            char_pitch.insert(e.name.trim().to_lowercase(), p);
+        }
+    }
+    let pitch_for = |character: &str| char_pitch.get(character).copied().unwrap_or(args.pitch);
     for s in &speakers {
-        eprintln!("storytime:   {s} -> {}", mapping.get(s).map_or("?", |v| v));
+        let p = pitch_for(s);
+        let pstr = if p != 0.0 { format!(", pitch {p:+}") } else { String::new() };
+        eprintln!("storytime:   {s} -> {}{pstr}", mapping.get(s).map_or("?", |v| v));
     }
 
     // 3. Load each distinct voice once. The style cap is the smallest across
@@ -1808,6 +1850,7 @@ fn run_script(
         voice_id: String,
         text: String,
         interrupts_prev: bool,
+        pitch: f32,
     }
     let mut turns: Vec<Turn> = Vec::new();
     for sp in &parsed.speeches {
@@ -1815,8 +1858,12 @@ fn run_script(
             .get(&sp.character)
             .cloned()
             .unwrap_or_else(|| narrator_default.clone());
+        let pitch = pitch_for(&sp.character);
+        // Only merge consecutive speeches that share both voice and pitch.
         let mergeable = !sp.interrupts_prev
-            && turns.last().is_some_and(|t| t.voice_id == vid && !t.interrupts_prev);
+            && turns.last().is_some_and(|t| {
+                t.voice_id == vid && (t.pitch - pitch).abs() < 1e-6 && !t.interrupts_prev
+            });
         if mergeable {
             let last = turns.last_mut().unwrap();
             last.text.push_str(&args.paragraph_marker);
@@ -1826,6 +1873,7 @@ fn run_script(
                 voice_id: vid,
                 text: sp.text.clone(),
                 interrupts_prev: sp.interrupts_prev,
+                pitch,
             });
         }
     }
@@ -1850,6 +1898,7 @@ fn run_script(
             max_tokens,
             rt,
             args.speed,
+            turn.pitch,
             args.trim_threshold,
             fade,
         )?;
@@ -2046,6 +2095,7 @@ fn main() -> Result<()> {
             max_tokens,
             &mut rt,
             args.speed,
+            args.pitch,
             args.trim_threshold,
             fade,
         )?;
@@ -2457,6 +2507,31 @@ mod tests {
         assert!(cli.command.is_none());
         assert_eq!(cli.synth.voice, "af_bella");
         assert_eq!(cli.synth.output.as_deref(), Some(Path::new("/tmp/x.wav")));
+    }
+
+    #[test]
+    fn pitch_ratio_and_resample_round_trip() {
+        // 0 semitones is identity; an octave doubles/halves the ratio.
+        assert!((pitch_ratio(0.0) - 1.0).abs() < 1e-6);
+        assert!((pitch_ratio(12.0) - 2.0).abs() < 1e-5);
+        assert!((pitch_ratio(-12.0) - 0.5).abs() < 1e-5);
+        // resample_ratio scales the sample count by the ratio (the pitch/tempo
+        // axis). The sinc resampler drops up to ~sinc_len/2 tail samples of
+        // filter latency, negligible for real multi-second chunks.
+        let sig: Vec<f32> = (0..24_000)
+            .map(|n| (2.0 * std::f32::consts::PI * 200.0 * n as f32 / 24_000.0).sin())
+            .collect();
+        let up = resample_ratio(&sig, 0.5).unwrap(); // pitch up an octave (~half length)
+        assert!((up.len() as i32 - 12_000).abs() <= 128, "got {}", up.len());
+        assert_eq!(resample_ratio(&sig, 1.0).unwrap().len(), sig.len()); // identity
+    }
+
+    #[test]
+    fn pitch_flag_parses_negative() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["storytime", "--pitch", "-3.5", "--voice", "af_bella"])
+            .expect("negative --pitch must parse");
+        assert!((cli.synth.pitch + 3.5).abs() < 1e-6);
     }
 
     #[test]
