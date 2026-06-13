@@ -131,9 +131,15 @@ sidecar, both rewritten atomically every ~50 steps or 60 s; the final `<name>.bi
 on completion (`finalize` renames the temp into place, removes the sidecar). `--resume` continues
 from the sidecar; `--budget-min`/kill leave the temps. The inference loader (`resolve_voice_path` in
 `main.rs`) makes `--voice <name>` fall back to `<name>.bin.temp`, so a partial voice previews under
-its eventual name while a second `storytime` keeps training. The `interrupt` module installs a
-SIGINT/SIGTERM handler (raw libc FFI) so Ctrl-C stops the walk gracefully with a checkpoint — and
-reclaims SIGINT if it was inherited as `SIG_IGN`; a second Ctrl-C hard-exits.
+its eventual name while a second `storytime` keeps training.
+
+**Ctrl-C** is handled by the shared `cli/src/interrupt.rs` module (raw libc FFI, no crate). Both
+entry points install a handler **after backend init** (so a backend's own signal handler can't
+clobber ours) and then `unblock` SIGINT/SIGTERM from the signal mask — together these reclaim
+Ctrl-C even when the process was launched with SIGINT inherited-ignored (`SIG_IGN`) or blocked,
+which is the usual reason "Ctrl-C does nothing." One-shot synthesis uses `install_abort` (any
+Ctrl-C → immediate `_exit`); `clone` uses `install_graceful` (first Ctrl-C flips a flag the walk
+polls → checkpoint + stop; second → hard exit).
 `cli/src/dsp.rs` holds the analysis DSP: WAV reading, a librosa-parity power spectrogram
 (fixture-tested), YIN F0, and the `SpeakerEncoder` over `assets/spk_encoder.onnx` (exported by
 `export.py`; parity gated by `export/verify_spk.py` and the `#[ignore]`d `spk_embedding_*` tests).

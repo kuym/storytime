@@ -32,6 +32,7 @@ mod mlx;
 
 mod clone;
 mod dsp;
+mod interrupt;
 mod script;
 
 // ort::Error doesn't implement std::error::Error; bridge via Display.
@@ -2017,6 +2018,10 @@ fn main() -> Result<()> {
     // Initialize the chosen inference backend (shared by both paths).
     let cache_dir = resolve_coreml_cache(args.no_coreml_cache, args.coreml_cache.as_deref())?;
     let mut rt = Runtime::init(backend, &assets, cache_dir)?;
+
+    // Reclaim Ctrl-C *after* backend init (so no library handler installed
+    // during init can clobber ours): a single Ctrl-C aborts one-shot synthesis.
+    interrupt::install_abort();
 
     let fade = (NATIVE_SR as usize * args.fade_ms as usize) / 1000;
 

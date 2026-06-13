@@ -166,13 +166,16 @@ recent, resumable checkpoint regardless of backend speed. On completion, `finali
 `<name>.bin.temp` → `<name>.bin` and deletes the sidecar; a non-completing stop (`--budget-min`,
 Ctrl-C, kill) leaves the temps in place.
 
-**Ctrl-C / SIGTERM** is handled explicitly (the `interrupt` module): `run()` installs a handler at
-startup that flips an atomic flag the walk polls, so the first interrupt finishes the current step,
-writes a checkpoint, and exits 0 via the same "paused" path as `--budget-min`; a second interrupt
-hard-exits (130). Installing our own handler also *reclaims* SIGINT when the process inherited it as
-ignored — a background shell job sets `SIGINT` to `SIG_IGN` and children inherit it, which otherwise
-silently swallows Ctrl-C. The handler is async-signal-safe (atomic store / `_exit` only) and uses
-raw libc FFI, no new crate.
+**Ctrl-C / SIGTERM** is handled by the shared `interrupt` module (`cli/src/interrupt.rs`).
+`clone::run` calls `interrupt::install_graceful()` **after** `Runtime::init` (so a backend that
+installs its own SIGINT handler during init can't clobber ours); the first interrupt flips an atomic
+flag the walk polls — finishing the current step, writing a checkpoint, and exiting 0 via the same
+"paused" path as `--budget-min` — and a second hard-exits (130). Installing the handler also
+*reclaims* SIGINT when the process was launched with it inherited-ignored (`SIG_IGN`), and the
+module `unblock`s SIGINT/SIGTERM from the signal mask in case a library blocked them — these two
+launch conditions are the usual reason "Ctrl-C does nothing." Everything the handler does is
+async-signal-safe (an atomic store / `_exit`); raw libc FFI, no new crate. (One-shot synthesis in
+`main.rs` uses the same module's `install_abort`, which exits immediately on any interrupt.)
 
 `--resume` reads the sidecar and continues toward the original `--steps` (seed re-derived as
 `seed + step` so it doesn't replay the same perturbations). Preview resolution: a bare `--voice

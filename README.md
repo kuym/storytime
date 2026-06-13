@@ -725,6 +725,14 @@ cloning feature. Re-run `./setup.sh`, or on an existing setup:
 **`Context leak detected, msgtracer returned -1`** — cosmetic noise from
 macOS's CoreML stack. Inference still runs correctly. Ignore.
 
+**Ctrl-C doesn't stop it** — storytime installs its own SIGINT/SIGTERM handler
+(after the backend loads) and unblocks those signals, so Ctrl-C stops one-shot
+synthesis immediately and `clone` after the current step (a second Ctrl-C force
+-quits). If it still does nothing, the signal isn't reaching the process: some
+IDE integrated terminals (older VS Code / JetBrains consoles) don't forward
+Ctrl-C to the foreground job — run storytime in a real terminal, or send the
+signal yourself with `kill -INT <pid>` (or `kill <pid>`).
+
 **Long inputs** — the model's style tensor has a fixed maximum length
 (510–511 phoneme tokens, depending on voice). The CLI handles this
 automatically: long inputs are split at sentence boundaries (`.!?;…`),
