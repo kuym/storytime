@@ -619,17 +619,39 @@ choice is purely speed.
 | `--budget-min` | `0` (off) | wall-clock cap in minutes; stops at whichever of `--steps`/budget hits first |
 | `--init` | auto | starting blend, e.g. `--init af_bella,af_heart`; default ranks all English voices against your recording and blends the top 3 |
 | `--seed` | `0` | RNG seed (best-effort reproducibility: CoreML/Metal inference is not bit-deterministic; use `--backend onnx` for stricter runs) |
-| `--resume` | | continue an interrupted walk from `voices/<name>.clone.json` |
+| `--resume` | | continue an interrupted walk from its saved state (`voices/<name>.bin.temp.json`) |
 | `--ref-text FILE` | built-in script | transcript, if you recorded something other than `--print-script` (needs espeak-ng) |
 | `--backend` | `mlx` if built with `--features mlx`, else `onnx` | runs both synthesis and the speaker encoder; `mlx` keeps the whole loop on the GPU |
 
-While a walk runs, the current best is checkpointed to `voices/<name>.bin`
-every 50 acceptances — you can **audition mid-run** from another terminal with
-`storytime --voice <name>` and stop early when it sounds right (re-run with
-`--resume` to continue). Recording tips: read the script naturally at your
-normal pitch, use a quiet room, and avoid clipping; clean input matters more
-than length. Cloning targets **English voices** (the speaker-similarity
-scorer is English-trained).
+#### Pause, resume, and preview (like a browser download)
+
+Training is incremental and crash-safe. While it runs, the in-progress voice
+lives in `voices/<name>.bin.temp` (a partial-download file), with its training
+state in a `voices/<name>.bin.temp.json` sidecar; both are rewritten atomically
+every ~50 steps or 60 seconds. The final `voices/<name>.bin` appears **only when
+training completes** (the temp file is then renamed into place and the sidecar
+removed). So you can:
+
+```sh
+# Start training, then stop it any time (Ctrl-C, kill, reboot) — it loses at
+# most the last interval.
+storytime clone --ref ref.wav --name myvoice --steps 2000
+
+# Resume from exactly where it left off (continues toward the original --steps):
+storytime clone --ref ref.wav --name myvoice --resume
+
+# Preview the partial voice from ANOTHER terminal while it's still training —
+# the bare name resolves to the in-progress .bin.temp until the final exists:
+echo "Once upon a time..." | storytime --voice myvoice -o preview.wav
+```
+
+`--budget-min N` is the same pause built in: it stops after N minutes leaving a
+resumable temp, so `--budget-min 5` then `--resume` (repeatedly) walks a long
+clone in short sessions. `--list-voices` shows in-progress clones as
+`<name> (training)`. Recording tips: read the script naturally at your normal
+pitch, use a quiet room, and avoid clipping; clean input matters more than
+length. Cloning targets **English voices** (the speaker-similarity scorer is
+English-trained).
 
 One-time prerequisite: `assets/spk_encoder.onnx`, produced by `./setup.sh`
 (or `python export/export.py --skip-model --skip-voices` on an existing

@@ -350,6 +350,25 @@ fn list_voices(assets: &Path) -> Result<()> {
     for n in voice_names(assets)? {
         println!("{n}");
     }
+    // In-progress clones (voices/<name>.bin.temp) are usable for preview under
+    // their bare name; flag them so they're discoverable.
+    let dir = assets.join("voices");
+    if let Ok(entries) = fs::read_dir(&dir) {
+        let mut training: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .and_then(|f| f.strip_suffix(".bin.temp"))
+                    .map(String::from)
+            })
+            .collect();
+        training.sort();
+        for n in training {
+            println!("{n} (training)");
+        }
+    }
     Ok(())
 }
 
@@ -1107,8 +1126,33 @@ struct Voice {
     rows: usize,
 }
 
+/// Resolve a `--voice` argument to a voicepack file. A bare voice name maps to
+/// `voices/<name>.bin`, falling back to the in-progress `voices/<name>.bin.temp`
+/// of a clone that is still training (so a partial voice can be previewed under
+/// the same name it will eventually have). A value that looks like a path
+/// (contains a separator or is absolute) is used verbatim, which also lets a
+/// `.bin.temp` be loaded explicitly.
+fn resolve_voice_path(assets: &Path, name: &str) -> PathBuf {
+    if name.contains('/') || name.contains('\\') || Path::new(name).is_absolute() {
+        return PathBuf::from(name);
+    }
+    let dir = assets.join("voices");
+    let final_path = dir.join(format!("{name}.bin"));
+    if final_path.exists() {
+        return final_path;
+    }
+    let temp_path = dir.join(format!("{name}.bin.temp"));
+    if temp_path.exists() {
+        eprintln!(
+            "storytime: voice '{name}' is still training; using in-progress {name}.bin.temp"
+        );
+        return temp_path;
+    }
+    final_path // fall through to the familiar "voice not found" error
+}
+
 fn load_voice(assets: &Path, name: &str) -> Result<Voice> {
-    let path = assets.join("voices").join(format!("{name}.bin"));
+    let path = resolve_voice_path(assets, name);
     let bytes = fs::read(&path).with_context(|| format!("voice not found: {}", path.display()))?;
     if bytes.len() % (STYLE_DIM * 4) != 0 {
         bail!("voice {name}: unexpected size {} bytes", bytes.len());
@@ -2413,6 +2457,31 @@ mod tests {
         assert!(cli.command.is_none());
         assert_eq!(cli.synth.voice, "af_bella");
         assert_eq!(cli.synth.output.as_deref(), Some(Path::new("/tmp/x.wav")));
+    }
+
+    #[test]
+    fn resolve_voice_path_falls_back_to_in_progress_temp() {
+        let dir = std::env::temp_dir().join("storytime-resolve-test");
+        let voices = dir.join("voices");
+        std::fs::create_dir_all(&voices).unwrap();
+        let final_p = voices.join("v.bin");
+        let temp_p = voices.join("v.bin.temp");
+        let _ = std::fs::remove_file(&final_p);
+        let _ = std::fs::remove_file(&temp_p);
+
+        // Neither exists -> the final path (so the error names the expected file).
+        assert_eq!(resolve_voice_path(&dir, "v"), final_p);
+        // Only the in-progress temp exists -> preview from it.
+        std::fs::write(&temp_p, b"x").unwrap();
+        assert_eq!(resolve_voice_path(&dir, "v"), temp_p);
+        // A completed voice wins over an in-progress one.
+        std::fs::write(&final_p, b"x").unwrap();
+        assert_eq!(resolve_voice_path(&dir, "v"), final_p);
+        // Path-like arguments pass through verbatim (lets a .temp be loaded explicitly).
+        assert_eq!(resolve_voice_path(&dir, "/abs/x.bin"), PathBuf::from("/abs/x.bin"));
+        assert_eq!(resolve_voice_path(&dir, "d/x.bin.temp"), PathBuf::from("d/x.bin.temp"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

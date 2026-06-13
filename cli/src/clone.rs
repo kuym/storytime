@@ -13,6 +13,14 @@
 //! ever *evaluates* the one or two rows its test texts select, so the other
 //! ~508 rows drift as unguided noise), feature differences are NaN-safe, and
 //! the RNG is seedable.
+//!
+//! Incremental / resumable, like a browser download. While training runs the
+//! in-progress voicepack lives in `voices/<name>.bin.temp` (raw f32, loadable
+//! for preview under the bare name) alongside a `voices/<name>.bin.temp.json`
+//! resume sidecar; both are rewritten atomically every ~50 steps or 60 s. The
+//! final `voices/<name>.bin` is created only on completion (the temp voicepack
+//! is renamed into place and the sidecar removed). A kill loses at most one
+//! interval; `--resume` continues from the sidecar.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -42,8 +50,12 @@ const MAX_DURATION_DRIFT: f32 = 0.30;
 const TRIM: f32 = 0.005;
 /// How many stock voices the automatic init blends.
 const AUTO_INIT_TOP: usize = 3;
-/// Checkpoint cadence, in acceptances.
-const CHECKPOINT_EVERY: u32 = 50;
+/// Checkpoint cadence: persist the in-progress voice + resume state at least
+/// this often, in steps *or* seconds (whichever comes first). Time-based as
+/// well as step-based so a slow (CPU) backend still saves on a useful cadence
+/// — a 5-minute run must leave something to resume from regardless of speed.
+const CHECKPOINT_EVERY_STEPS: u32 = 50;
+const CHECKPOINT_EVERY_SECS: u64 = 60;
 
 /// The paragraph the user records themselves reading (`--print-script`).
 /// Its IPA is baked below (`TARGET_IPA`) so espeak-ng is not needed at clone
@@ -102,7 +114,8 @@ pub struct CloneArgs {
     #[arg(long, default_value_t = 0)]
     pub seed: u64,
 
-    /// Resume an interrupted walk from <name>'s checkpoint.
+    /// Resume an interrupted walk from its saved state
+    /// (<assets>/voices/<name>.bin.temp.json).
     #[arg(long)]
     pub resume: bool,
 
@@ -203,9 +216,16 @@ fn write_voice_bin(path: &Path, base: &Voice, delta: &[f32], env: &Envelope) -> 
             bytes.extend_from_slice(&v.to_le_bytes());
         }
     }
-    let tmp = path.with_extension("bin.tmp");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)?;
+    atomic_write(path, &bytes)
+}
+
+/// Write `bytes` to `path` atomically (write a sibling scratch file, then
+/// rename over the target) so a reader — e.g. a preview `storytime` instance
+/// loading the in-progress `.bin.temp` — never observes a torn write.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let scratch = PathBuf::from(format!("{}.writing", path.display()));
+    std::fs::write(&scratch, bytes)?;
+    std::fs::rename(&scratch, path)?;
     Ok(())
 }
 
@@ -316,22 +336,42 @@ struct Checkpoint {
     delta: Vec<f32>,
 }
 
-fn checkpoint_path(assets: &Path, name: &str) -> PathBuf {
-    assets.join("voices").join(format!("{name}.clone.json"))
+/// The final voicepack — written only when training completes.
+fn final_voice_path(assets: &Path, name: &str) -> PathBuf {
+    assets.join("voices").join(format!("{name}.bin"))
 }
 
-fn save_checkpoint(assets: &Path, ck: &Checkpoint, base: &Voice, env: &Envelope) -> Result<()> {
-    let path = checkpoint_path(assets, &ck.name);
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string(ck)?)?;
-    std::fs::rename(&tmp, &path)?;
-    // Also refresh the auditionable voicepack: `--voice <name>` mid-run.
-    write_voice_bin(
-        &assets.join("voices").join(format!("{}.bin", ck.name)),
-        base,
-        &ck.delta,
-        env,
+/// The in-progress voicepack (raw f32, exactly `load_voice` format), like a
+/// browser's partial-download file. Loadable for preview while training runs
+/// and promoted to `final_voice_path` on completion.
+fn temp_voice_path(assets: &Path, name: &str) -> PathBuf {
+    assets.join("voices").join(format!("{name}.bin.temp"))
+}
+
+/// Sidecar holding the resume state (paired with the `.bin.temp` voicepack).
+fn temp_state_path(assets: &Path, name: &str) -> PathBuf {
+    assets.join("voices").join(format!("{name}.bin.temp.json"))
+}
+
+/// Persist a checkpoint: the in-progress voicepack (for preview) and the resume
+/// state sidecar. Both are written atomically.
+fn write_checkpoint(assets: &Path, ck: &Checkpoint, base: &Voice, env: &Envelope) -> Result<()> {
+    write_voice_bin(&temp_voice_path(assets, &ck.name), base, &ck.delta, env)?;
+    atomic_write(
+        &temp_state_path(assets, &ck.name),
+        serde_json::to_string(ck)?.as_bytes(),
     )
+}
+
+/// Promote a completed clone: rename the `.bin.temp` voicepack to the final
+/// `.bin` and drop the now-unneeded resume sidecar.
+fn finalize(assets: &Path, name: &str) -> Result<PathBuf> {
+    let temp = temp_voice_path(assets, name);
+    let final_p = final_voice_path(assets, name);
+    std::fs::rename(&temp, &final_p)
+        .with_context(|| format!("promoting {} -> {}", temp.display(), final_p.display()))?;
+    let _ = std::fs::remove_file(temp_state_path(assets, name));
+    Ok(final_p)
 }
 
 // ---------------------------------------------------------------------------
@@ -422,24 +462,35 @@ pub fn run(args: CloneArgs) -> Result<()> {
     let mut rt = Runtime::init(backend, &assets, cache)?;
 
     // --- Resume or fresh init.
-    let ck_path = checkpoint_path(&assets, name);
+    let state_path = temp_state_path(&assets, name);
+    let temp_voice = temp_voice_path(&assets, name);
     let mut checkpoint: Option<Checkpoint> = None;
     if args.resume {
-        let raw = std::fs::read_to_string(&ck_path)
-            .with_context(|| format!("--resume: no checkpoint at {}", ck_path.display()))?;
+        let raw = std::fs::read_to_string(&state_path).with_context(|| {
+            format!(
+                "--resume: no in-progress training for '{name}' (expected {})",
+                state_path.display()
+            )
+        })?;
         let ck: Checkpoint = serde_json::from_str(&raw)?;
         if ck.delta.len() != STYLE_DIM {
-            bail!("checkpoint {} is corrupt (delta length)", ck_path.display());
+            bail!("training state {} is corrupt (delta length)", state_path.display());
         }
         if !args.init.is_empty() {
             bail!("--resume restores the original --init; don't pass both");
         }
         checkpoint = Some(ck);
-    } else if ck_path.exists() {
+    } else if state_path.exists() {
         bail!(
-            "{} exists from a previous run; pass --resume to continue it or \
-             delete it (and voices/{name}.bin) to start over",
-            ck_path.display()
+            "in-progress training for '{name}' already exists; pass --resume to \
+             continue it, or delete {} and {} to start over",
+            state_path.display(),
+            temp_voice.display()
+        );
+    } else if final_voice_path(&assets, name).exists() {
+        eprintln!(
+            "clone: note: voices/{name}.bin already exists and will be overwritten \
+             when this training completes"
         );
     }
 
@@ -512,11 +563,18 @@ pub fn run(args: CloneArgs) -> Result<()> {
         }
     };
 
+    // Write an initial checkpoint before the first step so even an immediate
+    // kill (or a preview started right away) already has a resumable, loadable
+    // artifact — the baseline blend if nothing better has been found yet.
+    let ck = build_checkpoint(name, args.seed, step, accepted, &best, &init_weights, &best_delta);
+    write_checkpoint(&assets, &ck, ctx.base, ctx.env)?;
+
     // --- The walk: greedy hill climb.
     let mut rng = Rng::new(args.seed.wrapping_add(step as u64));
     let started = Instant::now();
     let budget = (args.budget_min as u64).checked_mul(60).unwrap_or(0);
     let mut last_heartbeat = Instant::now();
+    let mut last_checkpoint = Instant::now();
     let mut candidate = vec![0f32; STYLE_DIM];
     while step < args.steps {
         if budget > 0 && started.elapsed().as_secs() >= budget {
@@ -541,22 +599,18 @@ pub fn run(args: CloneArgs) -> Result<()> {
                     args.steps, best.total, best.target_sim, best.self_sim, best.feat_sim,
                     diversity
                 );
-                if accepted % CHECKPOINT_EVERY == 0 {
-                    let ck = Checkpoint {
-                        version: 1,
-                        name: name.to_string(),
-                        seed: args.seed,
-                        step,
-                        accepted,
-                        best_score: best.total,
-                        best_target_sim: best.target_sim,
-                        init: init_weights.clone(),
-                        delta: best_delta.clone(),
-                    };
-                    save_checkpoint(&assets, &ck, ctx.base, ctx.env)?;
-                    eprintln!("clone: checkpoint saved (audition with --voice {name})");
-                }
             }
+        }
+
+        // Persist the in-progress voice + resume state periodically (by step or
+        // wall-clock, whichever trips first) so a kill loses at most one
+        // interval, and a preview instance always sees a recent `.bin.temp`.
+        if step % CHECKPOINT_EVERY_STEPS == 0
+            || last_checkpoint.elapsed().as_secs() >= CHECKPOINT_EVERY_SECS
+        {
+            let ck = build_checkpoint(name, args.seed, step, accepted, &best, &init_weights, &best_delta);
+            write_checkpoint(&assets, &ck, ctx.base, ctx.env)?;
+            last_checkpoint = Instant::now();
         }
 
         if last_heartbeat.elapsed().as_secs() >= 30 {
@@ -569,30 +623,57 @@ pub fn run(args: CloneArgs) -> Result<()> {
         }
     }
 
-    // --- Final artifacts.
-    let ck = Checkpoint {
+    // --- Stop. Persist the latest state first (so a crash here still resumes),
+    // then either promote to the final voicepack (training complete) or leave
+    // the temp files in place to be resumed/previewed (paused early).
+    let ck = build_checkpoint(name, args.seed, step, accepted, &best, &init_weights, &best_delta);
+    write_checkpoint(&assets, &ck, ctx.base, ctx.env)?;
+    eprintln!(
+        "clone: stopped after {step}/{} steps ({accepted} accepted) in {:.0}s — \
+         score {:.2}: target sim {:.3} (baseline {:.3}), self {:.3}, feat {:.3}",
+        args.steps,
+        started.elapsed().as_secs_f32(),
+        best.total, best.target_sim, baseline.target_sim, best.self_sim, best.feat_sim
+    );
+
+    if step >= args.steps {
+        let final_p = finalize(&assets, name)?;
+        eprintln!(
+            "clone: done — wrote {} ({} steps). Try: echo \"Once upon a time...\" | storytime --voice {name}",
+            final_p.display(),
+            step
+        );
+    } else {
+        eprintln!(
+            "clone: paused — in-progress voice at {}",
+            temp_voice_path(&assets, name).display()
+        );
+        eprintln!("clone:   preview now:  echo \"Once upon a time...\" | storytime --voice {name}");
+        eprintln!("clone:   resume later: storytime clone --ref <ref.wav> --name {name} --resume");
+    }
+    Ok(())
+}
+
+fn build_checkpoint(
+    name: &str,
+    seed: u64,
+    step: u32,
+    accepted: u32,
+    best: &Score,
+    init: &[(String, f32)],
+    delta: &[f32],
+) -> Checkpoint {
+    Checkpoint {
         version: 1,
         name: name.to_string(),
-        seed: args.seed,
+        seed,
         step,
         accepted,
         best_score: best.total,
         best_target_sim: best.target_sim,
-        init: init_weights.clone(),
-        delta: best_delta.clone(),
-    };
-    save_checkpoint(&assets, &ck, ctx.base, ctx.env)?;
-    eprintln!(
-        "clone: done after {step} steps ({accepted} accepted) in {:.0}s",
-        started.elapsed().as_secs_f32()
-    );
-    eprintln!(
-        "clone: final score {:.2}: target sim {:.3} (baseline {:.3}), self {:.3}, feat {:.3}",
-        best.total, best.target_sim, baseline.target_sim, best.self_sim, best.feat_sim
-    );
-    eprintln!("clone: wrote voices/{name}.bin — try: echo \"Once upon a time...\" | storytime --voice {name}");
-    eprintln!("clone: re-run with --resume to keep optimizing, or a new --seed for a fresh walk");
-    Ok(())
+        init: init.to_vec(),
+        delta: delta.to_vec(),
+    }
 }
 
 /// Rank stock voices by speaker similarity to the reference and return the
@@ -681,6 +762,43 @@ mod tests {
                 assert!((got - want).abs() < 1e-6, "row {r} dim {c}");
             }
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkpoint_writes_loadable_temp_then_finalizes() {
+        let dir = std::env::temp_dir().join("storytime-clone-ckpt-test");
+        std::fs::create_dir_all(dir.join("voices")).unwrap();
+        let name = "ckvoice";
+        let base = synthetic_voice(510, |_, c| c as f32 * 0.001);
+        let env = Envelope {
+            std: vec![1.0; STYLE_DIM],
+            min: vec![-9.0; STYLE_DIM],
+            max: vec![9.0; STYLE_DIM],
+        };
+        let delta: Vec<f32> = (0..STYLE_DIM).map(|c| c as f32 * 0.002).collect();
+        let best = Score { total: 88.0, target_sim: 0.9, self_sim: 0.9, feat_sim: 0.9 };
+        let ck = build_checkpoint(name, 42, 123, 7, &best, &[("af_bella".into(), 1.0)], &delta);
+        write_checkpoint(&dir, &ck, &base, &env).unwrap();
+
+        // The in-progress voicepack is loadable for preview (no final .bin yet).
+        assert!(!final_voice_path(&dir, name).exists());
+        assert!(temp_voice_path(&dir, name).exists());
+        let preview = crate::load_voice(&dir, name).unwrap(); // resolves to .bin.temp
+        assert_eq!(preview.rows, 510);
+        // The state sidecar round-trips for --resume.
+        let raw = std::fs::read_to_string(temp_state_path(&dir, name)).unwrap();
+        let restored: Checkpoint = serde_json::from_str(&raw).unwrap();
+        assert_eq!(restored.step, 123);
+        assert_eq!(restored.delta.len(), STYLE_DIM);
+
+        // Completion promotes the temp voicepack and removes the state sidecar.
+        let final_p = finalize(&dir, name).unwrap();
+        assert!(final_p.exists());
+        assert!(!temp_voice_path(&dir, name).exists());
+        assert!(!temp_state_path(&dir, name).exists());
+        assert_eq!(crate::load_voice(&dir, name).unwrap().rows, 510); // now the final .bin
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

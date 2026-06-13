@@ -141,22 +141,44 @@ IPA is baked in as a constant, plus a second baked "other text" for self-similar
 | file | role |
 |---|---|
 | `cli/src/main.rs` | `Cli { Option<Cmd>, flatten Args }` wrapper (legacy flag-only invocation unchanged); `Runtime { init, synth }` wraps the ONNX/MLX backend so clone reuses the exact synthesis path |
-| `cli/src/clone.rs` | `CloneArgs`, walk loop, scoring, init blend / auto-rank, checkpoint/resume, `write_voice_bin`, baked IPA constants |
+| `cli/src/clone.rs` | `CloneArgs`, walk loop, scoring, init blend / auto-rank, incremental `.bin.temp` checkpoint + `--resume` + `finalize`, `write_voice_bin`/`atomic_write`, baked IPA constants |
+| `cli/src/main.rs` (loader) | `resolve_voice_path` — `--voice <name>` falls back to an in-progress `<name>.bin.temp`; `--list-voices` flags `(training)` |
 | `cli/src/dsp.rs` | WAV reading (hound `WavReader`), resampling, power spectrogram (realfft), YIN F0, acoustic stats, `SpeakerEncoder` (ort-CPU or MLX-GPU per backend), SplitMix64 RNG |
 | `cli/src/mlx/{mod,ops}.rs` | `MlxRuntime::run(inputs, output)` generic graph entry point (the encoder reuses it); `Relu` + `ReduceL2` ops added for the GE2E graph |
 | `export/export.py` | `+ GE2EWrapper` export → `assets/spk_encoder.onnx` (mel filterbank baked in); weights from the `resemblyzer` pip package or a pinned HF mirror; `--skip-spk` flag |
 | `export/verify_spk.py` | parity script: Resemblyzer vs exported ONNX cosine (expect > 0.999); `--dump-fixture` emits the Rust spectrogram test fixture |
 | `cli/Cargo.toml` | `+ realfft` (the only new crate; no `rand`, no pitch crate) |
 
-Checkpoint files: `<assets>/voices/<name>.clone.json` (walk state) + current-best `<name>.bin`,
-written atomically every 50 acceptances. `--resume` continues an interrupted walk (seed re-derived
-as `seed + step` so it doesn't replay the same perturbations).
+### Incremental / resumable training (browser-download model)
+
+Training never touches the final `<name>.bin` until it is finished. While it runs, two paired temp
+files live in `voices/`:
+
+- `<name>.bin.temp` — the in-progress voicepack, raw f32 in exactly `load_voice` format, so it is
+  directly usable for **preview** while training continues;
+- `<name>.bin.temp.json` — the resume state (init blend, delta, step, seed, accepted, best score).
+
+Both are rewritten **atomically** (write-sibling-then-rename, via `atomic_write`) every
+`CHECKPOINT_EVERY_STEPS` (50) **or** `CHECKPOINT_EVERY_SECS` (60) — whichever trips first, plus once
+before the first step and once at exit. The time trigger matters because a CPU run is slow enough
+that a step-only cadence could miss a short session; with it, a 5-minute run always leaves a
+recent, resumable checkpoint regardless of backend speed. On completion, `finalize()` renames
+`<name>.bin.temp` → `<name>.bin` and deletes the sidecar; a non-completing stop (`--budget-min`,
+kill) leaves the temps in place.
+
+`--resume` reads the sidecar and continues toward the original `--steps` (seed re-derived as
+`seed + step` so it doesn't replay the same perturbations). Preview resolution: a bare `--voice
+<name>` loads `<name>.bin` if it exists, else falls back to `<name>.bin.temp` (with a note);
+`--list-voices` flags in-progress clones as `<name> (training)`. A second `storytime` process
+previewing the partial voice is safe against the trainer's concurrent writes because every update
+is an atomic rename.
 
 ## Verification
 
 1. **Unit tests** — spectrogram vs a librosa-generated fixture; YIN on synthetic sines (± 2 Hz);
    seeded RNG stability; `write_voice_bin` ↔ `load_voice` round-trip; blend math; legacy CLI parse
-   still resolves to no-subcommand.
+   still resolves to no-subcommand; checkpoint → loadable `.bin.temp` → `finalize` promotion; the
+   `resolve_voice_path` in-progress fallback.
 2. **Embedding parity gates** (run before trusting any walk):
    - Rust ONNX path vs Python: `python export/verify_spk.py ref.wav` → Resemblyzer-vs-ONNX
      cosine > 0.999; then `cargo test spk_embedding_matches_python_frontend -- --ignored` for the
@@ -174,6 +196,10 @@ as `seed + step` so it doesn't replay the same perturbations).
    storytime clone --ref ref.wav --name kuy --budget-min 45
    echo "Once upon a time..." | storytime --voice kuy -o story.wav
    ```
+6. **Pause / resume / preview** (verified manually): start a clone, `kill` it mid-walk → only
+   `<name>.bin.temp{,.json}` remain (no final `.bin`); preview with `--voice <name>` (loads the
+   temp); `--resume` continues from the saved step and, on reaching `--steps`, promotes to
+   `<name>.bin` and removes the temps.
 
 ## Known limitations
 

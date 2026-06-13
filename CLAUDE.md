@@ -113,6 +113,14 @@ space (Kokoro's style encoder was never released, so cloning is search, not enco
 stock voices → perturb a shared per-dim delta → synthesize two baked test utterances via the normal
 `Runtime` → score vs the reference recording (GE2E speaker similarity + cross-text self-similarity
 + acoustic features, weighted harmonic mean) → write an ordinary `voices/<name>.bin`.
+
+Training is incremental/resumable like a browser download: the in-progress voicepack is
+`voices/<name>.bin.temp` (raw f32, preview-loadable) with a `voices/<name>.bin.temp.json` resume
+sidecar, both rewritten atomically every ~50 steps or 60 s; the final `<name>.bin` is created only
+on completion (`finalize` renames the temp into place, removes the sidecar). `--resume` continues
+from the sidecar; `--budget-min`/kill leave the temps. The inference loader (`resolve_voice_path` in
+`main.rs`) makes `--voice <name>` fall back to `<name>.bin.temp`, so a partial voice previews under
+its eventual name while a second `storytime` keeps training.
 `cli/src/dsp.rs` holds the analysis DSP: WAV reading, a librosa-parity power spectrogram
 (fixture-tested), YIN F0, and the `SpeakerEncoder` over `assets/spk_encoder.onnx` (exported by
 `export.py`; parity gated by `export/verify_spk.py` and the `#[ignore]`d `spk_embedding_*` tests).
